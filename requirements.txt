@@ -1,9 +1,0 @@
-Flask>=3.0.0
-scapy>=2.5.0
-scikit-learn>=1.3.0
-pandas>=2.0.0
-SQLAlchemy>=2.0.0
-numpy>=1.26.0
-requests>=2.31.0
-psutil>=5.9.0
-pypdf>=3.0.0
