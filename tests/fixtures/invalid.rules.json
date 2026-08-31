@@ -1,0 +1,5 @@
+[
+  {"sid": 1, "action": "DROP", "protocol": "TCP", "content": "x"},
+  {"sid": 1, "rev": 1, "action": "ALERT", "protocol": "TCP", "buffer": "not_a_buffer"},
+  {"sid": 1, "rev": 1, "action": "ALERT", "protocol": "TCP", "content": "duplicate"}
+]

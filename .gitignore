@@ -1,0 +1,33 @@
+# Virtual Environment
+venv/
+.venv/
+env/
+ENV/
+
+# Python Cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+nids.db
+
+# Environment variables
+.env
+
+# CMake build directories
+build/
+build-*/
+build_vs/
+CMakeCache.txt
+cmake-build-*/
+
+# IDE / Editor settings
+.vscode/
+.idea/
+*.swp
