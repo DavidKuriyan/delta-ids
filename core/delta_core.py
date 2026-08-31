@@ -35,8 +35,8 @@ class DeltaCore:
     @staticmethod
     def _is_same_subnet(ip1: str, ip2: str) -> bool:
         """Return True when both addresses are RFC 1918 private IPs in the
-        same /24 subnet (e.g. 192.168.68.0/24).  Local subnet pings are
-        normal network housekeeping and should not generate alerts."""
+        same /24 subnet (e.g. 192.168.68.0/24).  This is used only for
+        scan-detection tuning; alert suppression is handled separately."""
         try:
             a = ipaddress.ip_address(ip1)
             b = ipaddress.ip_address(ip2)
@@ -68,11 +68,7 @@ class DeltaCore:
             if icmp_type == 8:
                 if now - self._last_ping.get((src, dst), 0) >= 1:
                     self._last_ping[(src, dst)] = now
-                    # Suppress the per-ping alert when both IPs are on the same
-                    # local subnet — pings between neighbours (e.g. gateway ↔
-                    # host) are normal network housekeeping, not probes.
-                    if not self._is_same_subnet(src, dst):
-                        self._alert(packet, 90001, "Medium", f"ICMP echo request from {src} to {dst}")
+                    self._alert(packet, 90001, "Medium", f"ICMP echo request from {src} to {dst}")
             state = self._pings[src]
             observations = state["observations"]
             observations.append((now, dst))

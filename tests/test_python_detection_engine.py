@@ -56,18 +56,19 @@ class UdpScanRegressionTests(unittest.TestCase):
 
 
 class DetectionEngineSafetyTests(unittest.TestCase):
-    def test_metadata_only_rules_do_not_match_payload(self):
+    def test_configured_rules_match_representative_payload(self):
         engine = DetectionEngine("rules/rules.json")
         packet = {
-            "src_ip": "151.101.209.91",
-            "dst_ip": "10.35.194.204",
+            "src_ip": "192.0.2.1",
+            "dst_ip": "198.51.100.1",
             "protocol": "TCP",
-            "src_port": 443,
-            "dst_port": 50000,
-            "payload": bytes.fromhex("17 03 03 01 bd af 9e 35 bf 0d 24 29 49 b2 ee fb"),
+            "src_port": 40000,
+            "dst_port": 80,
+            "payload": b"GET /admin HTTP/1.1",
         }
-        self.assertEqual(engine.analyze_packet(packet), [])
-        self.assertEqual(engine.unsupported_rules, len(engine.rules))
+        alerts = engine.analyze_packet(packet)
+        self.assertEqual([alert["sid"] for alert in alerts], [1000002])
+        self.assertEqual(engine.unsupported_rules, 0)
 
     def test_explicit_content_rule_matches(self):
         engine = DetectionEngine.__new__(DetectionEngine)

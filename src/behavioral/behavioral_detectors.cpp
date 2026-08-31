@@ -34,11 +34,23 @@ public:
     explicit PortScanDetector(BehavioralConfig config) : config_(config) {}
     void observe(const packet::Packet& packet, const flow::Flow& flow, std::vector<BehavioralEvent>& events) override {
         if (!packet.source_port || !packet.destination_port || packet.transport == packet::TransportProtocol::icmp) return;
+        // Only count active probes. Established TCP data and ACK/RST replies
+        // otherwise make every busy server look like it is being scanned.
+        if (packet.transport == packet::TransportProtocol::tcp && packet.tcp) {
+            const auto flags = packet.tcp->flags;
+            if ((flags & 0x02U) == 0 || (flags & 0x10U) != 0 || (flags & 0x04U) != 0) return;
+        }
+        // UDP response traffic must not be counted as outbound probes.
+        if (packet.transport == packet::TransportProtocol::udp &&
+            (*packet.source_port == 53 || *packet.source_port == 67 ||
+             *packet.source_port == 68 || *packet.source_port == 123)) return;
         const auto source = ip_string(packet.source);
         const auto destination = ip_string(packet.destination);
         const auto key = source + "|" + destination + "|" + protocol_string(packet.transport);
         auto& state = states_[key];
-        state.observations.emplace_back(packet.timestamp_seconds, *packet.destination_port);
+        if (std::find_if(state.observations.begin(), state.observations.end(),
+                         [&](const auto& observation) { return observation.second == *packet.destination_port; }) == state.observations.end())
+            state.observations.emplace_back(packet.timestamp_seconds, *packet.destination_port);
         while (!state.observations.empty() &&
                packet.timestamp_seconds - state.observations.front().first > config_.window_seconds)
             state.observations.pop_front();

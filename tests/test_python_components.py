@@ -118,6 +118,13 @@ class CoreAndRulesTests(unittest.TestCase):
                                  "payload": b""})
         self.assertEqual([a["sid"] for a in recorder.alerts], [90001, 90001, 90001, 90002])
 
+    def test_configured_rules_are_native_valid(self):
+        result = __import__("subprocess").run(
+            ["./build/delta-nids", "--validate-rules", "rules/rules.json"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_rule_port_range_and_regex(self):
         engine = DetectionEngine.__new__(DetectionEngine)
         engine.rules = [{"gid": 2, "sid": 77, "rev": 3, "protocol": "TCP",

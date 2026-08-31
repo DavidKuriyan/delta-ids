@@ -13,7 +13,7 @@ DEDUP_WINDOW_SECONDS = 30.0
 # silently collapsed by source/destination/SID alone.
 
 MAX_ALERTS_PER_PACKET = 20
-SUPPORTED_FIELDS = {"sid", "rev", "revision", "action", "protocol", "src_port", "dst_port", "message", "severity", "priority", "gid", "content", "pcre", "regex", "evidence", "explanation"}
+SUPPORTED_FIELDS = {"sid", "rev", "revision", "action", "protocol", "src_port", "dst_port", "message", "severity", "priority", "gid", "content", "pcre", "regex", "evidence", "explanation", "direction", "service", "buffer", "nocase", "classification", "offset", "depth", "distance", "within", "threshold", "suppression_key"}
 # `heuristic_payload` is a legacy summary produced by parse_rules.py, not a
 # faithful representation of a content/URI condition. Treating it as a
 # raw substring creates false positives in arbitrary binary/encrypted payloads.
@@ -94,6 +94,10 @@ class DetectionEngine:
             if item["unsupported"]:
                 continue
             if item["protocol"] not in ("IP", protocol):
+                continue
+            if item["rule"].get("direction") == "client_to_server" and packet.get("direction") not in (None, "client_to_server"):
+                continue
+            if item["rule"].get("direction") == "server_to_client" and packet.get("direction") != "server_to_client":
                 continue
             if not self._port_matches(item["src_port"], packet.get("src_port")):
                 continue

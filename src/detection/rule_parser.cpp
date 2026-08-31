@@ -109,6 +109,12 @@ RuleLoadResult load_rules(const std::string& path) {
         }
         if (!identities.insert({rule.sid, rule.revision}).second) error(result, index, "sid", "duplicate sid/revision");
 
+        // Metadata-only exports may contain legacy fields such as
+        // `heuristic_payload`. They are not executable signatures, so reject
+        // them instead of silently loading rules that can never match.
+        if (item.contains("heuristic_payload") || item.contains("unsupported_source"))
+            error(result, index, "rule", "metadata-only rule has no executable detection condition");
+
         const auto action = item.value("action", "ALERT");
         if (action == "ALERT") rule.action = RuleAction::alert;
         else if (action == "LOG") rule.action = RuleAction::log;

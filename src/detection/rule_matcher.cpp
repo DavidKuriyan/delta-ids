@@ -27,7 +27,7 @@ bool port_matches(const std::optional<PortRange>& range, const std::optional<std
 std::vector<std::uint8_t> fold(const std::vector<std::uint8_t>& value, bool nocase) {
     if (!nocase) return value;
     auto result = value;
-    for (auto& byte : result) byte = static_cast<std::uint8_t>(std::tolower(byte));
+    for (auto& byte : result) byte = static_cast<std::uint8_t>(std::tolower(static_cast<unsigned char>(byte)));
     return result;
 }
 
@@ -41,7 +41,7 @@ std::optional<std::size_t> find_content(const std::vector<std::uint8_t>& data,
     for (std::size_t offset = begin; offset + needle.size() <= end; ++offset) {
         bool matched = true;
         for (std::size_t index = 0; index < needle.size(); ++index) {
-            const auto byte = nocase ? static_cast<std::uint8_t>(std::tolower(data[offset + index])) : data[offset + index];
+            const auto byte = nocase ? static_cast<std::uint8_t>(std::tolower(static_cast<unsigned char>(data[offset + index]))) : data[offset + index];
             if (byte != needle[index]) { matched = false; break; }
         }
         if (matched) return offset;
@@ -79,7 +79,7 @@ std::vector<RuleMatch> RuleMatcher::match(const MatchContext& context) const {
         const auto& data = buffer->data;
         const auto begin = rule.offset.value_or(0);
         const auto end = rule.depth ? begin + *rule.depth : data.size();
-        const auto& chain = rule.content_chain.empty() ? std::vector<std::vector<std::uint8_t>>{rule.content} : rule.content_chain;
+        const auto chain = rule.content_chain.empty() ? std::vector<std::vector<std::uint8_t>>{rule.content} : rule.content_chain;
         std::size_t cursor = begin;
         std::size_t first_offset = 0;
         std::size_t last_end = begin;
