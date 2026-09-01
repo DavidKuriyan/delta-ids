@@ -272,7 +272,7 @@ class DeltaCore:
         if not source or not destination:
             return
 
-        if protocol in ("ICMP", "ICMPV6") and packet.get("icmp_type") in (8, 128):
+        if protocol == "ICMP" and packet.get("icmp_type") == 8:
             # Ordinary ICMP echo requests are not attacks by themselves. Report
             # each (source, destination, protocol) pair at most once per scan
             # window as a bounded INFO-level visibility event. Capture-level
@@ -306,9 +306,6 @@ class DeltaCore:
             # from aggregating into a fake sweep.
             signature = str(packet.get("dst_port") or "0")
         else:
-            # ARP requests no longer participate in host-discovery sweeps:
-            # normal gateway neighbor resolution is L2 housekeeping, not a
-            # scan, so ARP is intentionally never correlated here.
             return
         if not active:
             return
@@ -386,19 +383,7 @@ class DeltaCore:
                     detection_type="dns_anomaly", confidence=65)
 
     def _repeated_connection_failures(self, packet: dict, now: float) -> None:
-        """Report repeated bare RST/FIN closures toward one service endpoint.
-
-        From a passive vantage point, authentication success/failure is not
-        visible for encrypted protocols. Repeated abandoned or failed
-        connections to a single (destination, destination port) are the
-        observable analogue of brute-force-like scanning and are reported here
-        with bounded, windowed state.
-
-        Only *bare* RST and FIN packets are counted (no ACK/SYN/PSH/URG). This
-        excludes normal teardown (FIN+ACK), target rejection responses
-        (RST+ACK), and probe classes such as Xmas (FIN+PSH+URG), so ordinary
-        traffic and scan responses cannot accumulate as failures.
-        """
+        """Report repeated bare RST/FIN closures toward one service endpoint."""
         if str(packet.get("protocol") or "").upper() != "TCP":
             return
         flags = self._tcp_flags(packet.get("tcp_flags"))
@@ -429,11 +414,7 @@ class DeltaCore:
                     detection_type="connection_failures", confidence=75)
 
     def _tcp_anomaly(self, packet: dict) -> None:
-        """Report invalid TCP flag combinations (SYN+FIN) as protocol anomalies.
-
-        The classification does not depend on the originating tool; SYN+FIN is
-        invalid for every TCP implementation (RFC 793).
-        """
+        """Report invalid TCP flag combinations (SYN+FIN) as protocol anomalies."""
         source = packet.get("src_ip")
         destination = packet.get("dst_ip")
         if not source or not destination:
@@ -456,10 +437,7 @@ class DeltaCore:
         ports_seen = {observed_port for _, observed_port in observations}
         response_counts = {name: sum(name in values for values in state["responses"].values())
                            for name in ("syn_ack", "rst", "icmp_unreachable")}
-        # An ACK-only packet is common in established traffic. Only call a
-        # multi-port ACK pattern a scan when the target also produced response
-        # evidence (normally RSTs), making the result defensible passively.
-        if probe_class in ("ack", "maimon") and response_counts["rst"] == 0 and response_counts["icmp_unreachable"] == 0:
+        if probe_class == "ack" and response_counts["rst"] == 0 and response_counts["icmp_unreachable"] == 0:
             return
         if len(ports_seen) < self.port_threshold or state["emitted"]:
             return
@@ -485,13 +463,11 @@ class DeltaCore:
     def _record_probe(self, packet: dict, source: str, destination: str,
                       protocol: str, probe_class: str, port: int, now: float,
                       response: str | None = None) -> None:
-        source_port = packet.get("src_port") if probe_class in ("ack", "maimon") else None
+        source_port = packet.get("src_port") if probe_class == "maimon" else None
         key = (source, destination, protocol, probe_class, source_port)
         state = self._ports.setdefault(key, {"observations": deque(), "responses": defaultdict(set),
                                               "source_ports": defaultdict(set), "emitted": False})
         observations = state["observations"]
-        # One source/target/class/port observation represents one probe target;
-        # retransmissions and duplicate capture paths must not inflate it.
         if not any(existing_port == port for _, existing_port in observations):
             observations.append((now, port))
         if packet.get("src_port") is not None:
@@ -504,10 +480,7 @@ class DeltaCore:
             state["emitted"] = False
         response_counts = {name: sum(name in values for values in state["responses"].values())
                            for name in ("syn_ack", "rst", "icmp_unreachable")}
-        # An ACK-only packet is common in established traffic. Only call a
-        # multi-port ACK pattern a scan when the target also produced response
-        # evidence (normally RSTs), making the result defensible passively.
-        if probe_class in ("ack", "maimon") and response_counts["rst"] == 0 and response_counts["icmp_unreachable"] == 0:
+        if probe_class == "ack" and response_counts["rst"] == 0 and response_counts["icmp_unreachable"] == 0:
             return
         if len(ports_seen) >= self.port_threshold and not state["emitted"]:
             state["emitted"] = True
@@ -540,8 +513,6 @@ class DeltaCore:
         if protocol == "TCP" and packet.get("dst_port") is not None:
             flags = self._tcp_flags(packet.get("tcp_flags"))
             self._tcp_anomaly(packet)
-            # ACK-only scans are only meaningful when they are not interleaved
-            # with FIN+ACK traffic from the same source/target flow.
             if flags == 0x10:
                 has_maimon_flow = any(
                     key[:4] == (str(source), str(destination), "TCP", "maimon")
@@ -550,31 +521,12 @@ class DeltaCore:
                 if has_maimon_flow:
                     return
             self._repeated_connection_failures(packet, now)
-            # Correlate target responses with each active probe class. The
-            # response source port is the probed destination port.
             if flags & 0x04 or (flags & 0x12) == 0x12:
                 response_kind = "rst" if flags & 0x04 else "syn_ack"
                 response_port = packet.get("src_port")
                 if response_port is not None:
-                            # A response can qualify only the exact reverse probe
-                    # state whose destination port it answers. Do not attach a
-                    # response to every scan class for the same tuple: that
-                    # cross-class fan-out was capable of turning unrelated
-                    # ACK/FIN-ACK traffic into a Maimon/ACK scan.
                     for probe_class in ("syn", "fin", "null", "xmas", "maimon", "ack"):
-                        response_state = None
-                        if probe_class == "ack":
-                            # Normal ACK traffic commonly coexists with
-                            # FIN+ACK traffic. Require the ACK class itself to
-                            # have a consistent source-port pattern; mixed
-                            # per-port streams are not probe evidence.
-                            ack_state = self._ports.get(
-                                (str(destination), str(source), "TCP", "ack", packet.get("dst_port")))
-                            if ack_state is not None:
-                                ack_sources = {port for ports in ack_state["source_ports"].values() for port in ports}
-                                if len(ack_sources) != 1:
-                                    continue
-                        if probe_class in ("ack", "maimon"):
+                        if probe_class == "maimon":
                             response_state = self._ports.get(
                                 (str(destination), str(source), "TCP", probe_class, packet.get("dst_port")))
                         else:
@@ -586,36 +538,18 @@ class DeltaCore:
                         source_ports = response_state.get("source_ports", {})
                         if int(response_port) not in observed_ports:
                             continue
-                        # ACK/MAIMON responses require the exact source port
-                        # used by the corresponding probe. Other probe classes
-                        # can correlate by the reverse destination port alone.
-                        if probe_class in ("ack", "maimon"):
+                        if probe_class == "maimon":
                             if (response_destination_port is None or
                                     int(response_destination_port) not in source_ports.get(int(response_port), set())):
                                 continue
-                            if probe_class == "ack":
-                                has_maimon_flow = any(
-                                    key[:4] == (str(destination), str(source), "TCP", "maimon")
-                                    for key in self._ports
-                                )
-                                if has_maimon_flow:
-                                    continue
-                            # ACK and FIN+ACK traffic sharing the same target
-                            # is normal connection traffic when both classes
-                            # use the same source-port set. Do not let RSTs for
-                            # that mixed stream qualify the ACK class.
-                            ack_state = self._ports.get(
-                                (str(destination), str(source), "TCP", "ack", packet.get("dst_port")))
-                            maimon_state = self._ports.get(
-                                (str(destination), str(source), "TCP", "maimon", packet.get("dst_port")))
-                            if ack_state is not None and maimon_state is not None:
-                                ack_sources = {port for ports in ack_state["source_ports"].values() for port in ports}
-                                maimon_sources = {port for ports in maimon_state["source_ports"].values() for port in ports}
-                                if ack_sources and maimon_sources and ack_sources != maimon_sources:
-                                    continue
-                            # A RST is useful evidence for ACK scans only when
-                            # the probe flow is unambiguous across the window.
-                            if (probe_class == "maimon" and response_kind == "rst"):
+                            if response_kind == "rst":
+                                continue
+                        elif probe_class == "ack":
+                            has_maimon_flow = any(
+                                key[:4] == (str(destination), str(source), "TCP", "maimon")
+                                for key in self._ports
+                            )
+                            if has_maimon_flow:
                                 continue
                         response_state["responses"][int(response_port)].add(response_kind)
                         self._emit_probe_if_ready(packet, str(destination), str(source), "TCP",
@@ -628,21 +562,17 @@ class DeltaCore:
 
         if protocol == "UDP" and packet.get("dst_port") is not None:
             self._dns_anomaly(packet, now)
-            # A UDP packet with no payload is still an observable UDP probe. Do
-            # not classify common server-source replies as outbound probes.
             if packet.get("src_port") not in (53, 67, 68, 123, 161):
                 self._record_probe(packet, str(source), str(destination), "UDP", "udp",
                                    int(packet["dst_port"]), now)
             return
 
-        # ICMP port-unreachable messages carry the original UDP probe. The
-        # scanner/target/port are recovered from the quoted inner IP packet.
-        if protocol in ("ICMP", "ICMPV6") and packet.get("icmp_type") in (1, 3):
+        if protocol == "ICMP" and packet.get("icmp_type") in (1, 3):
             inner_protocol = str(packet.get("icmp_inner_protocol") or "").upper()
             inner_source = packet.get("icmp_inner_src_ip")
             inner_destination = packet.get("icmp_inner_dst_ip")
             inner_port = packet.get("icmp_inner_dst_port")
-            if inner_protocol in ("UDP", "17", "58") and inner_source and inner_destination and inner_port is not None:
+            if inner_protocol in ("UDP", "17") and inner_source and inner_destination and inner_port is not None:
                 self._record_probe({**packet, "src_ip": inner_source, "dst_ip": inner_destination},
                                    str(inner_source), str(inner_destination), "UDP", "udp",
                                    int(inner_port), now, response="icmp_unreachable")

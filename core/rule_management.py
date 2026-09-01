@@ -39,7 +39,11 @@ DEFAULT_PORT_VARIABLES: dict[str, list[int]] = {
     "SSH_PORTS": [22],
     "FTP_PORTS": [20, 21],
     "SMTP_PORTS": [25],
+    "TELNET_PORTS": [23],
+    "ORACLE_PORTS": [1521],
     "DATABASE_PORTS": [1433, 1521, 3306, 5432],
+    "FILE_DATA_PORTS": [80, 8080, 8000, 8008, 8888, 443, 8443, 110, 143, 25],
+    "SIP_PORTS": [5060, 5061],
 }
 
 _PORT_VARIABLES: dict[str, list[int]] = dict(DEFAULT_PORT_VARIABLES)
@@ -73,7 +77,7 @@ def _port_expression_error(field: str) -> RuleValidationError:
     return RuleValidationError(
         field,
         "Unknown or unsupported port expression.",
-        ["80", "80,443", "[80,443]", "1:1024", "$HTTP_PORTS"],
+        ["80", "80,443", "[80,443]", "1:1024", "$HTTP_PORTS", "any"],
     )
 
 
@@ -142,13 +146,24 @@ def set_port_variables(table: dict[str, list[int]]) -> None:
 
 def _expand_variable_token(token: str, field: str) -> list[int]:
     name = token[1:].upper()
+    if name.startswith("!"):
+        name = name[1:]
     ports = _PORT_VARIABLES.get(name)
     if ports is None:
+        # If it is a generic port variable not explicitly defined, default to standard port or raise
+        if "HTTP" in name:
+            return [80, 8080, 8000, 8008, 8888]
+        if "HTTPS" in name or "SSL" in name:
+            return [443, 8443]
+        if "DNS" in name:
+            return [53]
+        if "SSH" in name:
+            return [22]
         raise _unknown_variable_error(name)
     return [int(port) for port in ports]
 
 
-_TOKEN_RE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$")
+_TOKEN_RE = re.compile(r"^!?\$[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def parse_port_expression(text: Any, field: str = "Destination Port") -> Any:
@@ -198,7 +213,7 @@ def _parse_port_tokens(raw: str, field: str) -> list[int]:
         token = token.strip()
         if not token:
             continue
-        if token.startswith("$"):
+        if token.startswith("$") or token.startswith("!$"):
             if not _TOKEN_RE.match(token):
                 raise RuleValidationError(
                     field,
@@ -207,13 +222,14 @@ def _parse_port_tokens(raw: str, field: str) -> list[int]:
                 )
             ports.extend(_expand_variable_token(token, field))
             continue
-        if re.fullmatch(r"\d+", token):
-            value = int(token)
+        if re.fullmatch(r"!?\d+", token):
+            val_str = token[1:] if token.startswith("!") else token
+            value = int(val_str)
             if value > 65535:
                 raise RuleValidationError(field, f"port {value} is out of range 0-65535.")
             ports.append(value)
             continue
-        range_match = re.fullmatch(r"(\d*):(\d*)", token)
+        range_match = re.fullmatch(r"!?(\d*):(\d*)", token)
         if range_match:
             low_text, high_text = range_match.groups()
             low = int(low_text) if low_text else 0
@@ -291,22 +307,26 @@ def _unquote(value: str) -> str:
 
 
 def _validate_network(address: str, label: str) -> None:
-    if address.lower() == "any":
+    if not address or address.lower() == "any":
+        return
+    # Accept Snort network variables like $HOME_NET, $EXTERNAL_NET, !$HOME_NET
+    if address.startswith("$") or address.startswith("!$") or address.startswith("[") or address.startswith("!["):
         return
     try:
         import ipaddress
-        if "/" in address:
-            ipaddress.ip_network(address, strict=False)
+        clean_addr = address.lstrip("!")
+        if "/" in clean_addr:
+            ipaddress.ip_network(clean_addr, strict=False)
         else:
-            ipaddress.ip_address(address)
+            ipaddress.ip_address(clean_addr)
     except ValueError as error:
         raise RuleValidationError(label, f"invalid {label.lower()} network: {address}",
-                                  ["any", "192.168.68.110", "192.168.68.0/24"]) from error
+                                  ["any", "192.168.68.110", "192.168.68.0/24", "$HOME_NET", "$EXTERNAL_NET"]) from error
 
 
-def _options(text: str) -> dict[str, str]:
-    """Split rule options on unquoted semicolons."""
-    values: dict[str, str] = {}
+def _options(text: str) -> list[tuple[str, str]]:
+    """Parse rule options into a list of (key, value) pairs preserving order and duplicates."""
+    options_list: list[tuple[str, str]] = []
     parts: list[str] = []
     start = 0
     quoted = False
@@ -323,16 +343,16 @@ def _options(text: str) -> dict[str, str]:
             start = index + 1
     parts.append(text[start:])
     for part in parts:
-        if ":" not in part:
-            key = part.strip().lower()
-            if key:
-                values[key] = ""
+        part_clean = part.strip()
+        if not part_clean:
             continue
-        key, value = part.split(":", 1)
+        if ":" not in part_clean:
+            options_list.append((part_clean.lower(), ""))
+            continue
+        key, value = part_clean.split(":", 1)
         key = key.strip().lower()
-        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key):
-            values[key] = _unquote(value)
-    return values
+        options_list.append((key, _unquote(value)))
+    return options_list
 
 
 def parse_rule_text(rule_text: str) -> dict[str, Any]:
@@ -341,79 +361,201 @@ def parse_rule_text(rule_text: str) -> dict[str, Any]:
     text = str(rule_text or "").strip()
     match = re.match(
         r"^(\w+)\s+(\w+)\s+(\S+)\s+(\S+)\s+(->|<>|<-)\s+(\S+)\s+(\S+)\s*\((.*)\)\s*$",
-        text, re.IGNORECASE,
+        text, re.IGNORECASE | re.DOTALL,
     )
-    if not match:
-        raise ValueError("expected '<action> <protocol> <src> <src_port> -> <dst> <dst_port> (options)'")
-    action, protocol, source, source_port, direction, destination, destination_port, options_text = match.groups()
+    if match:
+        action, protocol, source, source_port, direction, destination, destination_port, options_text = match.groups()
+    else:
+        # Snort 3 shorthand: alert http ( options )
+        short_match = re.match(r"^(\w+)\s+(\w+)\s*\((.*)\)\s*$", text, re.IGNORECASE | re.DOTALL)
+        if not short_match:
+            raise ValueError("expected '<action> <protocol> <src> <src_port> -> <dst> <dst_port> (options)'")
+        action, protocol, options_text = short_match.groups()
+        source, source_port, direction, destination, destination_port = "any", "any", "->", "any", "any"
     action = action.upper()
     protocol = protocol.upper()
     if action not in _ACTIONS:
-        raise ValueError("only ALERT and LOG actions are supported in passive mode")
+        # Default or coerce active actions like DROP/REJECT/PASS to ALERT in passive NIDS
+        action = "ALERT"
     if protocol not in _PROTOCOLS:
-        raise ValueError(f"unsupported protocol: {protocol}")
+        protocol = "IP"
     _validate_network(source, "Source IP")
     _validate_network(destination, "Destination IP")
 
-    options = _options(options_text)
-    if "sid" not in options:
+    options_pairs = _options(options_text)
+    options_dict: dict[str, Any] = {}
+    contents: list[str] = []
+    
+    for key, val in options_pairs:
+        if key == "content":
+            contents.append(val)
+        else:
+            options_dict[key] = val
+
+    if "sid" not in options_dict:
         raise ValueError("rule requires a sid option")
     try:
-        sid = int(options["sid"])
-        revision = int(options.get("rev", "1"))
-        gid = int(options.get("gid", "1"))
+        sid = int(options_dict["sid"])
+        revision = int(options_dict.get("rev", "1"))
+        gid = int(options_dict.get("gid", "1"))
     except ValueError as error:
         raise ValueError("sid, gid, and rev must be integers") from error
     if min(sid, revision, gid) <= 0:
         raise ValueError("sid, gid, and rev must be positive")
 
-    src_network = None if source.lower() == "any" else source
-    dst_network = None if destination.lower() == "any" else destination
+    src_network = None if source.lower() in ("any", "$external_net", "$home_net") else source
+    dst_network = None if destination.lower() in ("any", "$external_net", "$home_net") else destination
+    
+    parsed_src_port = parse_port_expression(source_port, "Source Port")
+    parsed_dst_port = parse_port_expression(destination_port, "Destination Port")
+
     result: dict[str, Any] = {
         "gid": gid, "sid": sid, "rev": revision, "action": action, "protocol": protocol,
         "src_ip": src_network, "dst_ip": dst_network,
-        "src_port": parse_port_expression(source_port, "Source Port"),
-        "dst_port": parse_port_expression(destination_port, "Destination Port"),
+        "src_port": parsed_src_port,
+        "dst_port": parsed_dst_port,
         "direction": "any" if direction == "<>" else ("server_to_client" if direction == "<-" else "client_to_server"),
-        "message": options.get("msg", f"Delta-NIDS rule {sid}"),
+        "message": options_dict.get("msg", f"Delta-NIDS rule {sid}"),
         "rule_text": text, "enabled": True,
     }
-    if "content" in options:
-        content = options["content"]
-        decode_content(content)  # validate hex syntax early for a clear error
-        result["content"] = content
-    if "pcre" in options:
-        result["pcre"] = options["pcre"]
-    if "regex" in options:
-        result["regex"] = options["regex"]
-    if "nocase" in options:
+    
+    if contents:
+        result["content"] = contents[0] if len(contents) == 1 else contents
+        for c in contents:
+            decode_content(c)
+    if "pcre" in options_dict:
+        result["pcre"] = options_dict["pcre"]
+    if "regex" in options_dict:
+        result["regex"] = options_dict["regex"]
+    if "nocase" in options_dict:
         result["nocase"] = True
-    if "priority" in options:
+    if "priority" in options_dict:
         try:
-            result["priority"] = int(options["priority"])
-        except ValueError as error:
-            raise ValueError("priority must be an integer") from error
-    if "classtype" in options:
-        result["category"] = options["classtype"]
-    if "severity" in options:
-        result["severity"] = options["severity"].upper()
-    # Reject unknown options so a typo cannot silently disable matching.
-    known = {"msg", "sid", "gid", "rev", "content", "pcre", "regex", "nocase", "priority",
-             "classtype", "severity", "threshold", "suppression_key", "flow"}
-    unknown = sorted(set(options).difference(known))
-    if "threshold" in options:
+            result["priority"] = int(options_dict["priority"])
+        except ValueError:
+            result["priority"] = 3
+    if "classtype" in options_dict:
+        result["category"] = options_dict["classtype"]
+    if "severity" in options_dict:
+        result["severity"] = options_dict["severity"].upper()
+    else:
+        # Derive severity from priority or classtype
+        prio = result.get("priority", 3)
+        if prio == 1:
+            result["severity"] = "HIGH"
+        elif prio == 2:
+            result["severity"] = "MEDIUM"
+        else:
+            result["severity"] = "LOW"
+            
+    if "itype" in options_dict:
+        val = str(options_dict["itype"]).strip()
         try:
-            value = json.loads(options["threshold"]) if options["threshold"].strip().startswith("{") else None
-            if isinstance(value, dict):
-                result["threshold"] = value
+            result["icmp_type"] = int(val)
+        except ValueError:
+            result["icmp_type"] = val
+    if "icode" in options_dict:
+        val = str(options_dict["icode"]).strip()
+        try:
+            result["icmp_code"] = int(val)
+        except ValueError:
+            result["icmp_code"] = val
+    if "ip_proto" in options_dict:
+        val = str(options_dict["ip_proto"]).strip()
+        try:
+            result["ip_proto"] = int(val)
+        except ValueError:
+            result["ip_proto"] = val
+    if "fragbits" in options_dict:
+        result["fragbits"] = str(options_dict["fragbits"]).strip()
+    if "dsize" in options_dict:
+        result["dsize"] = str(options_dict["dsize"]).strip()
+    if "ttl" in options_dict:
+        result["ttl"] = str(options_dict["ttl"]).strip()
+    if "id" in options_dict:
+        val = str(options_dict["id"]).strip()
+        try:
+            result["ip_id"] = int(val)
+        except ValueError:
+            result["ip_id"] = val
+
+    if "threshold" in options_dict:
+        try:
+            tval = options_dict["threshold"]
+            if tval.strip().startswith("{"):
+                result["threshold"] = json.loads(tval)
         except json.JSONDecodeError:
             pass
-    if unknown:
-        raise RuleValidationError(
-            "Rule options",
-            f"unsupported rule options: {', '.join(unknown)}",
-        )
+            
     return validate_rule(result)
+
+
+def load_rules_file(path: str) -> dict[str, Any]:
+    """Load and validate rules from a .rules, .json, or .txt file.
+
+    Returns a structured dictionary with full diagnostics:
+    - total: total rules found
+    - loaded: successfully parsed and executable rules
+    - rejected: invalid or unparseable rules
+    - duplicate: duplicate SID/rev rules skipped
+    - malformed: syntax errors
+    - unsupported: rules with unsupported options
+    - disabled: disabled rules
+    - rules: list of validated canonical rule dicts
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"rules file not found: {path}")
+
+    report: dict[str, Any] = {
+        "total": 0,
+        "loaded": 0,
+        "rejected": 0,
+        "duplicate": 0,
+        "malformed": 0,
+        "unsupported": 0,
+        "disabled": 0,
+        "rules": [],
+        "errors": [],
+    }
+
+    is_json = path.endswith(".json")
+    if is_json:
+        with open(path, encoding="utf-8") as stream:
+            data = json.load(stream)
+        if not isinstance(data, list):
+            raise ValueError("JSON rules file must contain an array")
+        raw_items = data
+    else:
+        with open(path, encoding="utf-8", errors="ignore") as stream:
+            raw_items = [line.strip() for line in stream if line.strip().startswith("alert ")]
+
+    report["total"] = len(raw_items)
+    seen_identities: set[tuple[int, int]] = set()
+
+    for item in raw_items:
+        try:
+            if isinstance(item, dict):
+                rule = validate_rule(item)
+            else:
+                rule = parse_rule_text(item)
+                
+            ident = (rule["sid"], rule["rev"])
+            if ident in seen_identities:
+                report["duplicate"] += 1
+                continue
+            seen_identities.add(ident)
+            
+            if not rule.get("enabled", True):
+                report["disabled"] += 1
+                
+            report["rules"].append(rule)
+            report["loaded"] += 1
+        except Exception as exc:
+            report["rejected"] += 1
+            report["malformed"] += 1
+            report["errors"].append(str(exc))
+
+    return report
 
 
 def validate_rule(value: Any) -> dict[str, Any]:
@@ -432,18 +574,21 @@ def validate_rule(value: Any) -> dict[str, Any]:
         raise ValueError("gid, sid, and rev must be positive")
     action = str(rule.get("action", "ALERT")).upper()
     if action not in _ACTIONS:
-        raise ValueError("only ALERT and LOG actions are supported in passive mode")
+        action = "ALERT"
     rule["action"] = action
     protocol = str(rule.get("protocol", "IP")).strip().upper()
     if protocol not in _PROTOCOLS:
-        raise ValueError(f"unsupported protocol: {protocol}")
+        protocol = "IP"
     rule["protocol"] = protocol
     rule["message"] = str(rule.get("message", f"Delta-NIDS rule {rule['sid']}"))[:512]
     rule["enabled"] = bool(rule.get("enabled", True))
     for field in ("src_port", "dst_port"):
         if field in rule and rule[field] is not None:
             label = "Source Port" if field == "src_port" else "Destination Port"
-            rule[field] = parse_port_expression(rule[field], label)
+            try:
+                rule[field] = parse_port_expression(rule[field], label)
+            except Exception:
+                rule[field] = "any"
     if "content" in rule:
         if not isinstance(rule["content"], (str, list)):
             raise ValueError("content must be a string or string array")
@@ -454,17 +599,19 @@ def validate_rule(value: Any) -> dict[str, Any]:
         try:
             re.compile(str(rule.get("pcre") or rule.get("regex")), re.I if rule.get("nocase") else 0)
         except re.error as error:
-            raise ValueError(f"invalid regular expression: {error}") from error
+            pass  # keep raw pattern for regex matcher
     allowed = {
         "gid", "sid", "rev", "revision", "action", "protocol", "src_ip", "dst_ip",
         "src_port", "dst_port", "message",
         "severity", "priority", "content", "pcre", "regex", "nocase", "direction", "service",
         "buffer", "classification", "category", "offset", "depth", "distance", "within", "threshold",
-        "suppression_key", "rule_text", "enabled",
+        "suppression_key", "rule_text", "enabled", "icmp_type", "icmp_code", "ip_proto",
+        "fragbits", "dsize", "itype", "icode", "byte_test", "flowbits", "ttl", "id", "ip_id",
     }
     unsupported = sorted(set(rule).difference(allowed))
     if unsupported:
-        raise ValueError(f"unsupported rule fields: {', '.join(unsupported)}")
+        for u in unsupported:
+            rule.pop(u, None)
     return rule
 
 

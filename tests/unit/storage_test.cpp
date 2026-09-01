@@ -76,7 +76,14 @@ int main() {
     limited->flush();
 
     bool rejected = false;
-    try { auto invalid = delta_nids::storage::make_sqlite_storage({"/proc/invalid/delta.db", 2}); (void)invalid; }
+    try {
+#ifdef _WIN32
+        auto invalid = delta_nids::storage::make_sqlite_storage({"Z:/nonexistent_subfolder_404_test/invalid.db", 2});
+#else
+        auto invalid = delta_nids::storage::make_sqlite_storage({"/proc/invalid/delta.db", 2});
+#endif
+        (void)invalid;
+    }
     catch (...) { rejected = true; }
     assert(rejected);
     std::remove(path);

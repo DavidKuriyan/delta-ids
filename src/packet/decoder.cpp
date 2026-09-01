@@ -207,7 +207,11 @@ DecodeResult decode(const capture::CapturedPacket& captured, std::string interfa
     }
     packet.ethernet.ether_type = ether_type;
     if (ether_type == kEtherTypeIpv4) return decode_ipv4(std::move(packet), reader, offset);
-    if (ether_type == kEtherTypeIpv6) return decode_ipv6(std::move(packet), reader, offset);
+    if (ether_type == kEtherTypeIpv6) {
+        telemetry::MetricsRegistry::global().increment("ipv6_packets_ignored");
+        packet.status = DecodeStatus::unsupported;
+        return failure(std::move(packet), DecodeStatus::unsupported, "IPv6 traffic ignored (IPv4-only NIDS pipeline)");
+    }
     packet.status = DecodeStatus::unsupported;
     return {std::move(packet), DecodeStatus::unsupported, "unsupported Ethernet protocol"};
 }

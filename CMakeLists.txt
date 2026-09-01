@@ -310,7 +310,7 @@ if(DELTA_NIDS_BUILD_TESTS)
     add_executable(delta-nids-api-integration-test
         tests/unit/api_integration_test.cpp
     )
-    target_link_libraries(delta-nids-api-integration-test PRIVATE delta_nids_core nlohmann_json::nlohmann_json)
+    target_link_libraries(delta-nids-api-integration-test PRIVATE delta_nids_core nlohmann_json::nlohmann_json ${DELTA_NIDS_SQLITE_TARGET})
     target_compile_features(delta-nids-api-integration-test PRIVATE cxx_std_17)
     add_test(NAME delta-nids-api-integration-test COMMAND delta-nids-api-integration-test)
 endif()

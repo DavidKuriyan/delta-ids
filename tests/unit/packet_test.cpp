@@ -76,5 +76,12 @@ int main() {
         auto result = delta_nids::packet::decode(captured(std::move(bytes)), "test0");
         assert(result.status == DecodeStatus::malformed);
     }
+    {
+        std::vector<std::uint8_t> bytes;
+        ethernet(bytes, 0x86DD);
+        bytes.insert(bytes.end(), 40, 0);
+        auto result = delta_nids::packet::decode(captured(std::move(bytes)), "test0");
+        assert(result.status == DecodeStatus::unsupported);
+    }
     return 0;
 }

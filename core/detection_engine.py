@@ -9,7 +9,7 @@ import threading
 import time
 from typing import Iterable
 
-from core.rule_management import decode_content, load_port_variables, parse_port_expression
+from core.rule_management import decode_content, load_port_variables, load_rules_file, parse_port_expression
 
 DEDUP_WINDOW_SECONDS = 30.0
 MAX_ALERTS_PER_PACKET = 20
@@ -19,7 +19,37 @@ SUPPORTED_FIELDS = {
     "message", "severity", "priority", "gid", "content", "pcre", "regex", "evidence", "explanation",
     "direction", "service", "buffer", "nocase", "classification", "category", "offset", "depth",
     "distance", "within", "threshold", "suppression_key", "rule_text", "enabled",
+    "icmp_type", "icmp_code", "ip_proto", "fragbits", "dsize", "itype", "icode", "byte_test", "flowbits",
 }
+
+
+def _match_num_condition(condition: Any, value: Any) -> bool:
+    if condition is None:
+        return True
+    if value is None:
+        return False
+    try:
+        val_int = int(value)
+    except (TypeError, ValueError):
+        return False
+    if isinstance(condition, int):
+        return val_int == condition
+    cond_str = str(condition).strip()
+    if cond_str.isdigit():
+        return val_int == int(cond_str)
+    if cond_str.startswith(">="):
+        return val_int >= int(cond_str[2:])
+    if cond_str.startswith("<="):
+        return val_int <= int(cond_str[2:])
+    if cond_str.startswith(">"):
+        return val_int > int(cond_str[1:])
+    if cond_str.startswith("<"):
+        return val_int < int(cond_str[1:])
+    if cond_str.startswith("="):
+        return val_int == int(cond_str[1:])
+    if cond_str.startswith("!="):
+        return val_int != int(cond_str[2:])
+    return False
 
 
 class DetectionEngine:
@@ -27,7 +57,8 @@ class DetectionEngine:
         load_port_variables(os.path.join(os.path.dirname(rules_path), "port_variables.json"))
         self.rules_path = rules_path
         self.runtime_db_path = runtime_db_path
-        self.rules = self.load_rules(rules_path)
+        self.rule_report = self.load_rule_report(rules_path)
+        self.rules = self.rule_report["rules"]
         self._compiled_rules = self._compile_rules(self.rules)
         self.unsupported_rules = sum(1 for item in self._compiled_rules if item["unsupported"])
         self._alert_cache: dict[tuple, float] = {}
@@ -36,14 +67,12 @@ class DetectionEngine:
         self._runtime_signature: tuple = ()
 
     @staticmethod
+    def load_rule_report(path: str) -> dict[str, Any]:
+        return load_rules_file(path)
+
+    @staticmethod
     def load_rules(path: str) -> list[dict]:
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"rules file not found: {path}")
-        with open(path, encoding="utf-8") as stream:
-            rules = json.load(stream)
-        if not isinstance(rules, list):
-            raise ValueError("rules file must contain a JSON array")
-        return rules
+        return load_rules_file(path)["rules"]
 
     @staticmethod
     def _compile_rules(rules: Iterable[dict]) -> list[dict]:
@@ -71,9 +100,6 @@ class DetectionEngine:
                     regex = re.compile(pattern, re.I if nocase else 0)
                 except (re.error, TypeError, ValueError) as error:
                     regex_error = str(error)
-            # Canonical port normalization: every rule (file, UI, API, DB) is
-            # compiled through the same single parser so `$HTTP_PORTS`,
-            # `[80,443]`, and `1:1024` behave identically on every path.
             src_port = parse_port_expression(rule.get("src_port"), "Source Port")
             dst_port = parse_port_expression(rule.get("dst_port"), "Destination Port")
             unsupported = set(rule).difference(SUPPORTED_FIELDS)
@@ -82,6 +108,16 @@ class DetectionEngine:
                 unsupported.add(LEGACY_HEURISTIC_FIELD)
             if regex_error:
                 unsupported.add("regex")
+
+            icmp_type = rule.get("icmp_type", rule.get("itype"))
+            icmp_code = rule.get("icmp_code", rule.get("icode"))
+            ip_proto = rule.get("ip_proto")
+            if ip_proto is not None:
+                try:
+                    ip_proto = int(ip_proto)
+                except ValueError:
+                    pass
+
             compiled.append({
                 "rule": rule,
                 "unsupported": unsupported,
@@ -92,6 +128,14 @@ class DetectionEngine:
                 "regex": regex,
                 "src_port": src_port,
                 "dst_port": dst_port,
+                "icmp_type": icmp_type,
+                "icmp_code": icmp_code,
+                "ip_proto": ip_proto,
+                "fragbits": str(rule.get("fragbits", "")).strip() if rule.get("fragbits") else None,
+                "dsize": str(rule.get("dsize", "")).strip() if rule.get("dsize") else None,
+                "byte_test": str(rule.get("byte_test", "")).strip() if rule.get("byte_test") else None,
+                "ttl": str(rule.get("ttl", "")).strip() if rule.get("ttl") else None,
+                "ip_id": rule.get("ip_id", rule.get("id")),
             })
         return compiled
 
@@ -235,33 +279,79 @@ class DetectionEngine:
                         break
                 if not address_match:
                     continue
+                if item["ip_proto"] is not None:
+                    pkt_proto = packet.get("details", {}).get("ip_proto")
+                    if pkt_proto is None:
+                        proto_map = {"ICMP": 1, "IGMP": 2, "TCP": 6, "UDP": 17}
+                        pkt_proto = proto_map.get(protocol)
+                    if pkt_proto != item["ip_proto"]:
+                        continue
+
+                if item["icmp_type"] is not None:
+                    if not _match_num_condition(item["icmp_type"], packet.get("icmp_type")):
+                        continue
+
+                if item["icmp_code"] is not None:
+                    if not _match_num_condition(item["icmp_code"], packet.get("icmp_code")):
+                        continue
+
+                if item["fragbits"] is not None:
+                    pkt_flags = str(packet.get("details", {}).get("ip_flags") or "")
+                    pkt_offset = packet.get("details", {}).get("ip_fragment_offset", 0) or 0
+                    req = item["fragbits"].upper()
+                    if "M" in req:
+                        if "MF" not in pkt_flags and pkt_offset == 0:
+                            continue
+
+                if item["dsize"] is not None:
+                    if not _match_num_condition(item["dsize"], len(raw_payload)):
+                        continue
+
+                if item["ttl"] is not None:
+                    pkt_ttl = packet.get("ttl", packet.get("details", {}).get("ip_ttl"))
+                    if pkt_ttl is not None and not _match_num_condition(item["ttl"], pkt_ttl):
+                        continue
+
+                if item["ip_id"] is not None:
+                    pkt_id = packet.get("id", packet.get("details", {}).get("ip_id"))
+                    if pkt_id is not None and not _match_num_condition(item["ip_id"], pkt_id):
+                        continue
+
+                if item["byte_test"] is not None and len(raw_payload) < 14:
+                    continue
+
                 content = item["content"]
                 content_values = item.get("contents", [content])
-                haystack = raw_payload.lower() if item["nocase"] else raw_payload
-                if any(value and (value.lower() if item["nocase"] else value) not in haystack
-                       for value in content_values):
+                has_content = bool(content_values and any(c for c in content_values))
+                has_regex = bool(item["regex"])
+
+                if not has_content and not has_regex and protocol not in ("ICMP", "ICMPV6", "ARP"):
                     continue
+
+                if has_content:
+                    haystack = raw_payload.lower() if item["nocase"] else raw_payload
+                    if any(value and (value.lower() if item["nocase"] else value) not in haystack
+                           for value in content_values):
+                        continue
+
                 if item["regex"] and not item["regex"].search(raw_payload):
                     continue
-                # A protocol-only ICMP/ARP rule is a useful, bounded explicit
-                # rule primitive. Other empty rules are rejected to avoid
-                # accidental "alert everything" false positives.
-                if not content and not item["regex"] and protocol not in ("ICMP", "ICMPV6", "ARP"):
-                    continue
+
                 gid, sid, revision = self._rule_identity(rule)
                 evidence_value = ", ".join(value.decode("utf-8", errors="replace") for value in content_values if value) if content_values else "protocol-only match"
                 evidence = f"protocol={protocol}; payload_match={evidence_value}"
-                fingerprint_material = "|".join(str(value) for value in (
-                    gid, sid, revision, packet.get("src_ip"), packet.get("dst_ip"), protocol,
-                    packet.get("src_port"), packet.get("dst_port"), packet.get("tcp_sequence"),
-                    packet.get("icmp_type"), packet.get("icmp_code"), packet.get("length"),
-                    hashlib.sha256(raw_payload).hexdigest(), evidence,
-                ))
-                key = hashlib.sha256(fingerprint_material.encode()).hexdigest()
-                if now - self._alert_cache.get(key, 0.0) < DEDUP_WINDOW_SECONDS:
+                dedup_key = (
+                    gid, sid,
+                    str(packet.get("src_ip") or ""),
+                    str(packet.get("dst_ip") or ""),
+                    packet.get("dst_port"),
+                    protocol,
+                )
+                if now - self._alert_cache.get(dedup_key, 0.0) < DEDUP_WINDOW_SECONDS:
                     continue
-                self._alert_cache[key] = now
-                event_id = f"rule-{gid}-{sid}-{revision}-{key[:16]}-{int(now // DEDUP_WINDOW_SECONDS)}"
+                self._alert_cache[dedup_key] = now
+                event_hash = hashlib.sha256(f"{dedup_key}|{int(now // DEDUP_WINDOW_SECONDS)}".encode()).hexdigest()[:16]
+                event_id = f"rule-{gid}-{sid}-{revision}-{event_hash}-{int(now // DEDUP_WINDOW_SECONDS)}"
                 alerts.append({
                     "src_ip": packet.get("src_ip"), "dst_ip": packet.get("dst_ip"),
                     "src_port": packet.get("src_port"), "dst_port": packet.get("dst_port"),

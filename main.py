@@ -73,11 +73,18 @@ def main(argv=None) -> int:
         args.interface = auto_detect_interface()
 
     root = os.path.dirname(os.path.abspath(__file__))
-    rules_path = args.config if os.path.isabs(args.config) else os.path.join(root, args.config)
+    default_delta_rules = os.path.join(root, "rules", "delta.rules")
+    if args.config == "rules/rules.json" and os.path.exists(default_delta_rules):
+        rules_path = default_delta_rules
+    else:
+        rules_path = args.config if os.path.isabs(args.config) else os.path.join(root, args.config)
     db_path = args.db or os.path.join(root, "database", "nids.db")
 
     try:
         engine = DetectionEngine(rules_path, runtime_db_path=db_path if args.persist else None)
+        if not args.quiet:
+            loaded_count = len(engine.rules)
+            print(f"Delta-NIDS loaded {loaded_count} detection rules from {os.path.basename(rules_path)}")
         manager = AlertManager(db_path=db_path, terminal=not args.quiet,
                                persist=args.persist or args.purge_false_positives)
         if args.purge_false_positives:
@@ -95,8 +102,8 @@ def main(argv=None) -> int:
         core = DeltaCore(
             manager, engine,
             scan_window=_env_float("DELTA_NIDS_SCAN_WINDOW", 30.0),
-            port_threshold=_env_int("DELTA_NIDS_PORT_SCAN_THRESHOLD", 8),
-            ping_threshold=_env_int("DELTA_NIDS_PING_THRESHOLD", 5),
+            port_threshold=_env_int("DELTA_NIDS_PORT_SCAN_THRESHOLD", 5),
+            ping_threshold=_env_int("DELTA_NIDS_PING_THRESHOLD", 3),
             remote_sweep_threshold=_env_int("DELTA_NIDS_REMOTE_SWEEP_THRESHOLD", 200),
             remote_sweep_enabled=_env_bool("DELTA_NIDS_REMOTE_SWEEP_ENABLED", False),
             dns_threshold=_env_int("DELTA_NIDS_DNS_QUERY_THRESHOLD", 50),

@@ -143,6 +143,19 @@ _MIGRATIONS = (
 )
 
 
+def _clean_ipv6_records(engine) -> None:
+    """Purge legacy IPv6 entries so they never leak into the IPv4-only NIDS pipeline."""
+    from sqlalchemy import text
+
+    with engine.connect() as connection:
+        try:
+            connection.execute(text("DELETE FROM traffic_logs WHERE src_ip LIKE '%:%' OR dst_ip LIKE '%:%'"))
+            connection.execute(text("DELETE FROM alerts WHERE source_ip LIKE '%:%' OR destination_ip LIKE '%:%' OR protocol = 'ICMPv6' OR protocol = 'IPV6'"))
+            connection.commit()
+        except Exception:
+            pass
+
+
 def _migrate_existing_tables(engine) -> None:
     """Add columns introduced after the first release without touching existing data."""
     from sqlalchemy import text
@@ -153,6 +166,7 @@ def _migrate_existing_tables(engine) -> None:
             if rows and all(row[1] != column for row in rows):
                 connection.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {definition}"))
                 connection.commit()
+    _clean_ipv6_records(engine)
 
 
 def init_db(db_path="nids.db"):
@@ -164,7 +178,8 @@ def init_db(db_path="nids.db"):
         raise PermissionError(f"database is not writable: {database}; repair ownership or permissions")
     if not os.access(parent, os.W_OK):
         raise PermissionError(f"database directory is not writable: {parent}; repair ownership or permissions")
-    engine = create_engine(f"sqlite:///{database}", future=True)
+    engine = create_engine(f"sqlite:///{database}", future=True, pool_pre_ping=True)
     Base.metadata.create_all(engine)
     _migrate_existing_tables(engine)
-    return sessionmaker(bind=engine, future=True)()
+    session = sessionmaker(bind=engine, future=True)()
+    return session

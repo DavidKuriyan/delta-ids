@@ -135,7 +135,7 @@ class DetectionEngineSafetyTests(unittest.TestCase):
         self.assertEqual(engine.unsupported_rules, 0)
 
     def test_runtime_rules_refresh_atomically(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             engine = DetectionEngine("rules/rules.json", runtime_db_path=db_path)
             from database.models import Rule, init_db
@@ -156,16 +156,17 @@ class DetectionEngineSafetyTests(unittest.TestCase):
             row.rule_json = json.dumps({**rule, "enabled": False})
             session.commit()
             session.close()
+            session.get_bind().dispose()
             engine.refresh_if_changed(force=True)
             self.assertEqual(engine.analyze_packet(packet), [])
 
-    def test_ipv6_protocol_only_rule_matches(self):
+    def test_icmp_protocol_only_rule_matches(self):
         engine = DetectionEngine.__new__(DetectionEngine)
-        engine.rules = [{"sid": 900002, "rev": 1, "protocol": "ICMPV6", "message": "icmpv6"}]
+        engine.rules = [{"sid": 900002, "rev": 1, "protocol": "ICMP", "message": "icmp"}]
         engine._compiled_rules = engine._compile_rules(engine.rules)
         engine.unsupported_rules = 0
         engine._alert_cache = {}
-        packet = {"src_ip": "2001:db8::1", "dst_ip": "2001:db8::2", "protocol": "ICMPv6", "icmp_type": 128, "length": 64, "payload": b""}
+        packet = {"src_ip": "192.168.1.1", "dst_ip": "192.168.1.2", "protocol": "ICMP", "icmp_type": 8, "length": 64, "payload": b""}
         alerts = engine.analyze_packet(packet)
         self.assertEqual(len(alerts), 1)
         self.assertEqual(alerts[0]["sid"], 900002)
@@ -197,7 +198,7 @@ class DetectionEngineSafetyTests(unittest.TestCase):
 
 class DashboardRuleApiTests(unittest.TestCase):
     def test_rule_crud_search_and_authoritative_state(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -229,7 +230,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 404)
 
     def test_port_variable_rule_end_to_end(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -261,7 +262,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertEqual([a["sid"] for a in alerts], [100023])
 
     def test_bracketed_port_list_rule_via_dashboard(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -273,7 +274,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertEqual(response.get_json()["dst_port"], "80,443")
 
     def test_unknown_port_variable_validation_error(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -288,7 +289,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertIn("HTTP_PORTS", error)
 
     def test_invalid_port_expression_validation_error(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -303,7 +304,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                     self.assertIn(form, error)
 
     def test_sort_port_variables_endpoint(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -315,7 +316,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertIn("HTTPS_PORTS", variables)
 
     def test_fields_based_rule_creation(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):
@@ -333,7 +334,7 @@ class DashboardRuleApiTests(unittest.TestCase):
                 self.assertIn("sid:1002006", payload["rule_text"])
 
     def test_rule_details_endpoint_returns_loaded_rule_metadata(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
             db_path = str(Path(directory) / "rules.sqlite")
             client = app.test_client()
             with patch("dashboard.app.DB_PATH", db_path):

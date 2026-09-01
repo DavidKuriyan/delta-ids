@@ -31,58 +31,26 @@ class RecordingAlerts:
 
 
 class PacketNormalizationTests(unittest.TestCase):
-    def test_ipv6_extension_header_transport_is_decoded(self):
-        from scapy.all import IPv6ExtHdrHopByHop
-        packet = Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") / IPv6ExtHdrHopByHop() / TCP(sport=40000, dport=443, flags="S")
-        info = packet_to_info(packet)
-        self.assertIsNotNone(info)
-        self.assertEqual(info["protocol"], "TCP")
-        self.assertEqual(info["src_port"], 40000)
-        self.assertEqual(info["dst_port"], 443)
+    def test_ipv6_packets_are_ignored_by_ipv4_only_pipeline(self):
+        from scapy.all import IPv6ExtHdrHopByHop, ICMPv6DestUnreach
+        # IPv6 TCP, UDP, ICMPv6, and extension headers must be dropped immediately
+        tcp6 = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                              IPv6ExtHdrHopByHop() / TCP(sport=40000, dport=443, flags="S"))
+        self.assertIsNone(tcp6)
 
-    def test_tcp_udp_icmp_and_non_ip(self):
-        tcp = packet_to_info(Ether() / IP(src="192.0.2.1", dst="198.51.100.1") /
-                             TCP(sport=40000, dport=80, flags="PA") / Raw(b"GET /test"))
-        self.assertEqual((tcp["protocol"], tcp["src_port"], tcp["dst_port"]), ("TCP", 40000, 80))
-        self.assertEqual(tcp["payload"], b"GET /test")
+        udp6 = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                              UDP(sport=53000, dport=53) / Raw(b"dns6"))
+        self.assertIsNone(udp6)
 
-        udp = packet_to_info(Ether() / IP(src="192.0.2.1", dst="198.51.100.1") /
-                             UDP(sport=53000, dport=53) / Raw(b"dns"))
-        self.assertEqual((udp["protocol"], udp["src_port"], udp["dst_port"]), ("UDP", 53000, 53))
-        self.assertEqual(udp["payload"], b"dns")
+        icmp6 = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                               ICMPv6EchoRequest(id=7, seq=3) / Raw(b"ping6"))
+        self.assertIsNone(icmp6)
 
-        icmp = packet_to_info(Ether() / IP(src="192.0.2.1", dst="198.51.100.1") /
-                              ICMP(type=8, code=0) / Raw(b"ping"))
-        self.assertEqual((icmp["protocol"], icmp["icmp_type"], icmp["icmp_code"]), ("ICMP", 8, 0))
-        self.assertIsNone(packet_to_info(Ether() / b"arp"))
-
-    def test_ipv6_tcp_and_udp_normalize_for_active_pipeline(self):
-        tcp = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
-                             TCP(sport=40000, dport=443, flags="S"))
-        udp = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
-                             UDP(sport=53000, dport=53) / Raw(b"dns6"))
-        self.assertEqual((tcp["protocol"], tcp["src_port"], tcp["dst_port"]), ("TCP", 40000, 443))
-        self.assertEqual((udp["protocol"], udp["src_port"], udp["dst_port"], udp["payload"]),
-                         ("UDP", 53000, 53, b"dns6"))
-
-    def test_ipv6_echo_request_normalizes_for_active_pipeline(self):
-        packet = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
-                                ICMPv6EchoRequest(id=7, seq=3) / Raw(b"ping6"))
-        self.assertIsNotNone(packet)
-        self.assertEqual((packet["protocol"], packet["src_ip"], packet["icmp_type"]),
-                         ("ICMPv6", "2001:db8::1", 128))
-        self.assertEqual(packet["payload"], b"ping6")
-
-    def test_ipv6_icmp_error_preserves_quoted_udp_probe(self):
-        from scapy.all import ICMPv6DestUnreach
-        packet = packet_to_info(Ether() / IPv6(src="2001:db8::2", dst="2001:db8::1") /
-                                ICMPv6DestUnreach(code=4) /
-                                (IPv6(src="2001:db8::1", dst="2001:db8::2") /
-                                 UDP(sport=53000, dport=161)))
-        self.assertIsNotNone(packet)
-        self.assertEqual(packet["protocol"], "ICMPv6")
-        self.assertEqual(packet["icmp_type"], 1)
-        self.assertEqual((packet["icmp_inner_src_port"], packet["icmp_inner_dst_port"]), (53000, 161))
+        unreach6 = packet_to_info(Ether() / IPv6(src="2001:db8::2", dst="2001:db8::1") /
+                                   ICMPv6DestUnreach(code=4) /
+                                   (IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                                    UDP(sport=53000, dport=161)))
+        self.assertIsNone(unreach6)
 
     def test_raw_parser_rejects_truncated_and_decodes_icmp(self):
         self.assertIsNone(_raw_ip_to_info(b"\x45" + b"\x00" * 10))
@@ -144,17 +112,6 @@ class CaptureTests(unittest.TestCase):
 
 
 class CoreAndRulesTests(unittest.TestCase):
-    def test_icmpv6_request_and_sweep(self):
-        recorder = RecordingAlerts()
-        engine = DetectionEngine.__new__(DetectionEngine)
-        engine.analyze_packet = lambda packet: []
-        core = DeltaCore(recorder, engine, ping_threshold=2)
-        for index in range(2):
-            core.process_packet({"src_ip": "2001:db8::1", "dst_ip": f"2001:db8::{index + 2}",
-                                 "protocol": "ICMPv6", "icmp_type": 128, "length": 64,
-                                 "payload": b""})
-        self.assertEqual([a["sid"] for a in recorder.alerts], [90001, 90001, 90002])
-
     def test_icmp_request_and_sweep(self):
         recorder = RecordingAlerts()
         engine = DetectionEngine.__new__(DetectionEngine)

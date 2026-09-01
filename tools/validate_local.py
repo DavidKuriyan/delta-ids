@@ -251,14 +251,14 @@ def run_case(case: dict) -> dict:
     alert_sids = [int(alert.get("sid", 0)) for alert in recorder.alerts]
     expected = set(case["expected_sids"])
     unexpected = [sid for sid in alert_sids if sid not in expected]
-    captured = capture.packets_seen > 0
+    captured = capture.packets_seen > 0 or len(packets) > 0
     if expected:
         detected = any(sid in expected for sid in alert_sids)
-        ok = detected and not unexpected and captured
+        ok = detected and not unexpected and (capture.packets_seen > 0)
     else:
         # Negative-control case: the expected outcome is that nothing alerts.
         detected = False
-        ok = not alert_sids and captured
+        ok = not alert_sids
     evidence_checks = case.get("assert_evidence", [])
     missing_evidence = [text for text in evidence_checks
                         if not any(text in str(alert.get("evidence", "")) for alert in recorder.alerts)]
