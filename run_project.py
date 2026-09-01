@@ -83,6 +83,11 @@ def command(args: argparse.Namespace) -> int:
         env = os.environ.copy()
         env["DELTA_NIDS_API_URL"] = f"http://127.0.0.1:{args.api_port}"
         env["DELTA_NIDS_DASHBOARD_PORT"] = str(args.dashboard_port)
+        env["DELTA_NIDS_DB_PATH"] = str(db)
+        # dashboard/app.py imports `core.*` from the project root. Python only
+        # puts the script's own directory (dashboard/) on sys.path, so without
+        # PYTHONPATH the import fails with ModuleNotFoundError.
+        env["PYTHONPATH"] = str(ROOT) + os.pathsep + env.get("PYTHONPATH", "")
         dashboard = subprocess.Popen([python_bin, str(ROOT / "dashboard" / "app.py")], cwd=ROOT, env=env)
         processes.append(dashboard)
         wait_for(f"http://127.0.0.1:{args.api_port}/api/status", api)

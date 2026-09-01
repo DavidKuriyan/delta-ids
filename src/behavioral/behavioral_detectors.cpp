@@ -20,6 +20,27 @@ std::string protocol_string(packet::TransportProtocol value) {
         default: return "other";
     }
 }
+std::string probe_class(std::uint8_t flags) {
+    if ((flags & 0x02U) && !(flags & (0x10U | 0x04U | 0x01U))) return "syn";
+    if (flags == 0x10U) return "ack";
+    if (flags == (0x01U | 0x10U)) return "maimon";
+    if (flags == 0x01U) return "fin";
+    if (flags == 0) return "null";
+    if (flags == (0x01U | 0x08U | 0x20U)) return "xmas";
+    return {};
+}
+
+bool is_host_discovery_probe(const packet::Packet& packet) {
+    if (packet.transport == packet::TransportProtocol::icmp && packet.icmp)
+        return packet.icmp->type == 8; // IPv4 echo request
+    if (packet.transport == packet::TransportProtocol::icmpv6 && packet.icmp)
+        return packet.icmp->type == 128; // IPv6 echo request
+    if (packet.transport == packet::TransportProtocol::tcp && packet.tcp)
+        return (packet.tcp->flags & 0x02U) != 0 &&
+               (packet.tcp->flags & (0x10U | 0x04U)) == 0;
+    return false;
+}
+
 
 struct Window {
     std::deque<std::int64_t> times;
@@ -34,23 +55,35 @@ public:
     explicit PortScanDetector(BehavioralConfig config) : config_(config) {}
     void observe(const packet::Packet& packet, const flow::Flow& flow, std::vector<BehavioralEvent>& events) override {
         if (!packet.source_port || !packet.destination_port || packet.transport == packet::TransportProtocol::icmp) return;
-        // Only count active probes. Established TCP data and ACK/RST replies
-        // otherwise make every busy server look like it is being scanned.
+        std::string scan_class;
         if (packet.transport == packet::TransportProtocol::tcp && packet.tcp) {
-            const auto flags = packet.tcp->flags;
-            if ((flags & 0x02U) == 0 || (flags & 0x10U) != 0 || (flags & 0x04U) != 0) return;
+            scan_class = probe_class(packet.tcp->flags);
+            if (scan_class.empty()) return;
+            // ACK-only probes are ambiguous without reverse response evidence;
+            // the native detector does not yet correlate quoted responses.
+            if (scan_class == "ack") return;
+        } else if (packet.transport == packet::TransportProtocol::udp) {
+            // UDP response traffic must not be counted as outbound probes.
+            if (*packet.source_port == 53 || *packet.source_port == 67 ||
+                *packet.source_port == 68 || *packet.source_port == 123) return;
+            scan_class = "udp";
+        } else {
+            return;
         }
-        // UDP response traffic must not be counted as outbound probes.
-        if (packet.transport == packet::TransportProtocol::udp &&
-            (*packet.source_port == 53 || *packet.source_port == 67 ||
-             *packet.source_port == 68 || *packet.source_port == 123)) return;
         const auto source = ip_string(packet.source);
         const auto destination = ip_string(packet.destination);
-        const auto key = source + "|" + destination + "|" + protocol_string(packet.transport);
-        auto& state = states_[key];
+        const auto key = source + "|" + destination + "|" + protocol_string(packet.transport) + "|" + scan_class;
+        auto state_iterator = states_.find(key);
+        if (state_iterator == states_.end()) {
+            if (states_.size() >= config_.maximum_sources && !states_.empty()) states_.erase(states_.begin());
+            state_iterator = states_.emplace(key, State{}).first;
+        }
+        auto& state = state_iterator->second;
         if (std::find_if(state.observations.begin(), state.observations.end(),
                          [&](const auto& observation) { return observation.second == *packet.destination_port; }) == state.observations.end())
             state.observations.emplace_back(packet.timestamp_seconds, *packet.destination_port);
+        if (state.observations.size() > config_.maximum_destinations_per_source)
+            state.observations.pop_front();
         while (!state.observations.empty() &&
                packet.timestamp_seconds - state.observations.front().first > config_.window_seconds)
             state.observations.pop_front();
@@ -59,9 +92,11 @@ public:
         if (ports.size() < config_.port_scan_threshold) state.emitted = false;
         if (ports.size() >= config_.port_scan_threshold && !state.emitted) {
             state.emitted = true;
+            const auto message = "possible " + scan_class + " port scan";
+            const auto explanation = "source contacted one destination on " +
+                std::to_string(ports.size()) + " distinct destination ports within the configured window";
             events.push_back({BehavioralType::port_scan, packet.timestamp_seconds, flow.id, source, destination,
-                              protocol_string(packet.transport), "possible vertical port scan",
-                              "source contacted one destination on " + std::to_string(ports.size()) + " distinct destination ports within the configured window", 85});
+                              protocol_string(packet.transport), message, explanation, 85});
         }
     }
     void expire(std::int64_t now) override {
@@ -77,30 +112,73 @@ private:
     std::map<std::string, State> states_;
 };
 
+// Globally-routable (Internet) destinations are ordinary client egress. Host
+// discovery is local-network reconnaissance, so sweep correlation must not
+// count Internet destinations against the threshold.
+bool is_globally_routable(const packet::IpAddress& address) {
+    if (address.family == packet::AddressFamily::ipv6) return false; // conservative: count v6 as eligible
+    if (address.bytes.size() < 4) return true;
+    const auto a = address.bytes[0], b = address.bytes[1], c = address.bytes[2], d = address.bytes[3];
+    if (a == 10) return false;
+    if (a == 127) return false;
+    if (a == 169 && b == 254) return false;
+    if (a == 172 && b >= 16 && b <= 31) return false;
+    if (a == 192 && b == 168) return false;
+    // Documentation / test ranges (TEST-NET-1/2/3, benchmarking 198.18-19):
+    if (a == 192 && b == 0 && c == 2) return false;
+    if (a == 198 && b == 51 && c == 100) return false;
+    if (a == 203 && b == 0 && c == 113) return false;
+    if (a == 198 && b >= 18 && b <= 19) return false;
+    if (a == 100 && b >= 64 && b <= 127) return false; // CGNAT
+    if (a >= 224) return false; // multicast/reserved
+    return true;
+}
+
 class HostSweepDetector final : public BehavioralDetector {
 public:
     explicit HostSweepDetector(BehavioralConfig config) : config_(config) {}
     void observe(const packet::Packet& packet, const flow::Flow& flow, std::vector<BehavioralEvent>& events) override {
+        if (!is_host_discovery_probe(packet)) return;
+        if (is_globally_routable(packet.destination)) return;
         const auto source = ip_string(packet.source);
-        auto& state = states_[source];
-        state.times.add(packet.timestamp_seconds, config_.window_seconds);
-        state.destinations.insert(ip_string(packet.destination));
-        if (state.destinations.size() >= config_.host_sweep_threshold && !state.emitted) {
+        const auto protocol = protocol_string(packet.transport);
+        const auto key = source + "|" + protocol;
+        auto state_iterator = states_.find(key);
+        if (state_iterator == states_.end()) {
+            if (states_.size() >= config_.maximum_sources && !states_.empty()) states_.erase(states_.begin());
+            state_iterator = states_.emplace(key, State{}).first;
+        }
+        auto& state = state_iterator->second;
+        state.observations.emplace_back(packet.timestamp_seconds, ip_string(packet.destination));
+        while (!state.observations.empty() &&
+               packet.timestamp_seconds - state.observations.front().first > config_.window_seconds)
+            state.observations.pop_front();
+        while (state.observations.size() > config_.maximum_destinations_per_source)
+            state.observations.pop_front();
+        std::set<std::string> destinations;
+        for (const auto& observation : state.observations) destinations.insert(observation.second);
+        if (destinations.size() < config_.host_sweep_threshold) state.emitted = false;
+        if (destinations.size() >= config_.host_sweep_threshold && !state.emitted) {
             state.emitted = true;
             events.push_back({BehavioralType::host_sweep, packet.timestamp_seconds, flow.id, source, ip_string(packet.destination),
-                              protocol_string(packet.transport), "possible host sweep",
-                              "source contacted " + std::to_string(state.destinations.size()) + " unique hosts within the configured window", 80});
+                              protocol, "possible host sweep",
+                              "source contacted " + std::to_string(destinations.size()) + " unique non-Internet hosts within the configured window", 80});
         }
     }
     void expire(std::int64_t now) override {
         for (auto iterator = states_.begin(); iterator != states_.end();) {
-            if (!iterator->second.times.times.empty() && now - iterator->second.times.times.back() > config_.window_seconds) iterator = states_.erase(iterator);
+            if (!iterator->second.observations.empty() &&
+                now - iterator->second.observations.back().first > config_.window_seconds)
+                iterator = states_.erase(iterator);
             else ++iterator;
         }
     }
     void reset() override { states_.clear(); }
 private:
-    struct State { Window times; std::set<std::string> destinations; bool emitted = false; };
+    struct State {
+        std::deque<std::pair<std::int64_t, std::string>> observations;
+        bool emitted = false;
+    };
     BehavioralConfig config_;
     std::map<std::string, State> states_;
 };

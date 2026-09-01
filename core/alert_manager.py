@@ -39,6 +39,20 @@ def format_human_alert(timestamp: int, alert: dict, severity: str) -> str:
             f'[Priority: {priority}] {{{protocol}}} {source} -> {destination}')
 
 
+def alert_fingerprint(alert: dict, timestamp: int) -> str:
+    """Build an event identity without turning source identity into suppression."""
+    event_id = alert.get("event_id")
+    fingerprint_material = "|".join(str(value) for value in (
+        alert.get('gid', 1), alert.get('sid', 0), alert.get('revision', 1),
+        alert.get('src_ip') or "", alert.get('src_port'), alert.get('dst_ip') or "",
+        alert.get('dst_port'), alert.get('protocol', ''), alert.get('service', ''),
+        alert.get('detection_type', 'behavioral' if alert.get('is_ml_anomaly') else 'signature'),
+        event_id if event_id is not None else int(timestamp // 30),
+        alert.get('evidence', ''), alert.get('message', ''),
+    ))
+    return hashlib.sha256(fingerprint_material.encode()).hexdigest()
+
+
 class AlertManager:
     def __init__(self, db_path: str | None = None, terminal: bool = True, persist: bool = False):
         self.session = init_db(db_path) if db_path and persist else None
@@ -47,6 +61,7 @@ class AlertManager:
         self.session_start = datetime.datetime.now(datetime.timezone.utc)
         self._live_traffic = deque(maxlen=500)
         self._live_alerts = deque(maxlen=1000)
+        self._live_alert_index: dict[str, dict] = {}
         self._alert_counter = 0
         self._lock = threading.RLock()
         if self.session:
@@ -58,7 +73,25 @@ class AlertManager:
         with self._lock:
             try:
                 for rule in rules:
-                    self.session.merge(Rule(sid=int(rule.get('sid', 0)), revision=int(rule.get('rev', rule.get('revision', 1)) or 1), message=rule.get('message', ''), enabled=True, source_file=source_file, gid=int(rule.get('gid', 1) or 1), priority=int(rule.get('priority', 3) or 3), protocol=str(rule.get('protocol', ''))))
+                    sid = int(rule.get('sid', 0) or 0)
+                    revision = int(rule.get('rev', rule.get('revision', 1)) or 1)
+                    existing = self.session.query(Rule).filter_by(sid=sid, revision=revision).one_or_none()
+                    enabled = existing.enabled if existing is not None else bool(rule.get('enabled', True))
+                    rule_copy = dict(rule)
+                    rule_copy['enabled'] = enabled
+                    rule_copy.setdefault('rule_text', rule.get('rule_text', ''))
+                    row = existing or Rule(sid=sid, revision=revision)
+                    row.message = rule.get('message', '')
+                    row.enabled = enabled
+                    row.source_file = source_file
+                    row.gid = int(rule.get('gid', 1) or 1)
+                    row.priority = int(rule.get('priority', 3) or 3)
+                    row.protocol = str(rule.get('protocol', ''))
+                    row.category = rule.get('category', rule.get('classification', ''))
+                    row.rule_text = rule_copy.get('rule_text', '')
+                    row.rule_json = json.dumps(rule_copy, separators=(',', ':'))
+                    row.updated_at = time.time_ns()
+                    self.session.add(row)
                 self.session.commit()
             except SQLAlchemyError as error:
                 self.session.rollback()
@@ -83,10 +116,26 @@ class AlertManager:
 
     def log_alert(self, alert):
         timestamp = now_epoch()
+        fingerprint = alert_fingerprint(alert, timestamp)
         with self._lock:
-            self._alert_counter += 1
-            event = {"id": self._alert_counter, "timestamp": timestamp, **alert}
-            self._live_alerts.appendleft(event)
+            existing = self._live_alert_index.get(fingerprint)
+            if existing is None:
+                self._alert_counter += 1
+                event = {"id": self._alert_counter, "timestamp": timestamp,
+                         "occurrence_count": 1, **alert}
+                self._live_alerts.appendleft(event)
+                self._live_alert_index[fingerprint] = event
+                if len(self._live_alert_index) > self._live_alerts.maxlen * 2:
+                    live_ids = {id(item) for item in self._live_alerts}
+                    self._live_alert_index = {
+                        key: item for key, item in self._live_alert_index.items()
+                        if id(item) in live_ids
+                    }
+            else:
+                # Keep one realtime row for the same event, while persistence
+                # below still increments occurrence_count for auditability.
+                existing["timestamp"] = timestamp
+                existing["occurrence_count"] = int(existing.get("occurrence_count", 1)) + 1
         severity = str(alert.get("severity", "Low")).upper()
         if severity not in {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}:
             severity = "LOW"
@@ -99,8 +148,10 @@ class AlertManager:
                 source = alert.get("src_ip") or ""
                 destination = alert.get("dst_ip") or ""
                 sid = alert.get("sid") or 0
-                fingerprint = hashlib.sha256(f"{source}|{destination}|{sid}|{alert.get('message', '')}".encode()).hexdigest()
-                values = {"first_seen": timestamp, "last_seen": timestamp, "occurrence_count": 1, "suppressed_count": 0, "severity": severity, "confidence": int(alert.get("confidence", 0) or 0), "risk": int(alert.get("risk", 0) or 0), "detection_type": "behavioral" if alert.get("is_ml_anomaly") else "signature", "sid": sid, "revision": int(alert.get("revision", 1) or 1), "source_ip": source, "source_port": alert.get("src_port"), "destination_ip": destination, "destination_port": alert.get("dst_port"), "protocol": alert.get("protocol") or "", "service": alert.get("service") or "", "flow_id": int(alert.get("flow_id", 0) or 0), "traffic_id": int(alert.get("traffic_id", 0) or 0), "message": alert.get("message") or "", "evidence": alert.get("evidence") or "", "explanation": alert.get("explanation") or "", "fingerprint": fingerprint}
+                fingerprint = alert_fingerprint(alert, timestamp)
+                provided_type = alert.get("detection_type")
+                detection_type = "behavioral" if provided_type not in (None, "signature") or alert.get("is_ml_anomaly") else "signature"
+                values = {"first_seen": timestamp, "last_seen": timestamp, "occurrence_count": 1, "suppressed_count": 0, "severity": severity, "confidence": int(alert.get("confidence", 0) or 0), "risk": int(alert.get("risk", 0) or 0), "detection_type": detection_type, "sid": sid, "revision": int(alert.get("revision", 1) or 1), "source_ip": source, "source_port": alert.get("src_port"), "destination_ip": destination, "destination_port": alert.get("dst_port"), "protocol": alert.get("protocol") or "", "service": alert.get("service") or "", "flow_id": int(alert.get("flow_id", 0) or 0), "traffic_id": int(alert.get("traffic_id", 0) or 0), "message": alert.get("message") or "", "evidence": alert.get("evidence") or "", "explanation": alert.get("explanation") or "", "fingerprint": fingerprint}
                 statement = sqlite_insert(Alert).values(**values).on_conflict_do_update(index_elements=[Alert.__table__.c.fingerprint], set_={"last_seen": values["last_seen"], "occurrence_count": Alert.__table__.c.occurrence_count + 1, "traffic_id": values["traffic_id"]})
                 self.session.execute(statement)
                 self.session.commit()
@@ -150,10 +201,10 @@ class AlertManager:
                 self.session.rollback()
                 logger.error("failed to persist incident: %s", error)
 
-    def persist_runtime_status(self, status: str, interface: str | None = None, packets_captured: int = 0, packets_processed: int = 0, last_packet_time: float | None = None, error: str | None = None) -> None:
+    def persist_runtime_status(self, status: str, interface: str | None = None, packets_captured: int = 0, packets_processed: int = 0, last_packet_time: float | None = None, error: str | None = None, packets_failed: int = 0) -> None:
         if not self.session:
             return
-        payload = json.dumps({"status": status, "interface": interface, "packets_captured": packets_captured, "packets_processed": packets_processed, "last_packet_time": last_packet_time, "error": error})
+        payload = json.dumps({"status": status, "interface": interface, "packets_captured": packets_captured, "packets_processed": packets_processed, "last_packet_time": last_packet_time, "error": error, "packets_failed": packets_failed})
         with self._lock:
             try:
                 self.session.query(Statistic).filter(Statistic.name == "capture_runtime").delete(synchronize_session=False)
@@ -180,11 +231,20 @@ class AlertManager:
     def get_recent_alerts(self, limit=500):
         return list(self._live_alerts)[:limit]
 
+    def __del__(self):
+        # Best-effort cleanup for short-lived replay/test processes. Long-lived
+        # applications should call close() explicitly during shutdown.
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def clear_runtime_state(self) -> None:
         """Clear in-memory event views without affecting capture or rules."""
         with self._lock:
             self._live_traffic.clear()
             self._live_alerts.clear()
+            self._live_alert_index.clear()
 
     def get_alert_counts(self):
         counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "total": 0}
@@ -193,6 +253,47 @@ class AlertManager:
             counts[severity] = counts.get(severity, 0) + 1
             counts["total"] += 1
         return counts
+
+    def purge_false_sweep_alerts(self, host_threshold: int | None = None,
+                                 arp_threshold: int | None = None) -> int:
+        """Remove persisted SID 90002 alerts that cannot be justified.
+
+        Alerts produced by the pre-fix host-discovery detector claimed a
+        "host discovery sweep" on the basis of a weak target count and no
+        scope awareness. This revalidates each stored 90002 row against the
+        current evidence contract and deletes rows whose stored evidence
+        records fewer distinct targets than the configured threshold (which is
+        also the case for the alerts generated by the old default threshold).
+
+        Returns the number of alerts removed.
+        """
+        if not self.session:
+            return 0
+        from database.models import Alert, IncidentAlert
+        import re as _re
+        removed = 0
+        with self._lock:
+            try:
+                rows = self.session.query(Alert).filter(Alert.sid == 90002).all()
+                for row in rows:
+                    evidence = row.evidence or ""
+                    protocol = (row.protocol or "").upper()
+                    threshold = arp_threshold if protocol == "ARP" else host_threshold
+                    if threshold is None:
+                        continue
+                    match = _re.search(r"distinct_targets=(\d+)", evidence)
+                    if not match:
+                        continue
+                    if int(match.group(1)) < threshold:
+                        self.session.query(IncidentAlert).filter_by(alert_id=row.id).delete(synchronize_session=False)
+                        self.session.delete(row)
+                        removed += 1
+                self.session.commit()
+            except SQLAlchemyError as error:
+                self.session.rollback()
+                logger.error("failed to purge sweep alerts: %s", error)
+                raise
+        return removed
 
     def reset_session_data(self) -> None:
         """Remove current-session evidence while preserving configured rules."""

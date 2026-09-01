@@ -69,6 +69,34 @@ bool parse_size(std::string_view text, std::size_t& output) {
     output=value; return true;
 }
 
+std::string url_decode(std::string_view value) {
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        if (value[index] == '+') {
+            decoded.push_back(' ');
+            continue;
+        }
+        if (value[index] == '%' && index + 2 < value.size()) {
+            const auto hex = [](char character) -> int {
+                if (character >= '0' && character <= '9') return character - '0';
+                if (character >= 'a' && character <= 'f') return character - 'a' + 10;
+                if (character >= 'A' && character <= 'F') return character - 'A' + 10;
+                return -1;
+            };
+            const int high = hex(value[index + 1]);
+            const int low = hex(value[index + 2]);
+            if (high >= 0 && low >= 0) {
+                decoded.push_back(static_cast<char>((high << 4) | low));
+                index += 2;
+                continue;
+            }
+        }
+        decoded.push_back(value[index]);
+    }
+    return decoded;
+}
+
 // Accepts Unix epoch seconds or a server-local "YYYY-MM-DD[ HH:MM[:SS]]" value so
 // searches use the same clock the NIDS runs on (see /api/system).
 bool parse_time_filter(const std::string& text, std::int64_t& output) {
@@ -103,7 +131,7 @@ json incident_json(const incident::Incident& value) {
 struct Query { std::unordered_map<std::string,std::string> values; };
 Query parse_query(std::string_view query) {
     Query result; std::size_t start=0; std::size_t fields=0;
-    while(start<query.size() && fields++<64) { const auto separator=query.find('&',start); const auto token=query.substr(start,separator==std::string_view::npos?query.size()-start:separator-start); const auto equal=token.find('='); if(equal!=std::string_view::npos && equal>0) result.values.emplace(std::string(token.substr(0,equal)),std::string(token.substr(equal+1))); if(separator==std::string_view::npos) break; start=separator+1; }
+    while(start<query.size() && fields++<64) { const auto separator=query.find('&',start); const auto token=query.substr(start,separator==std::string_view::npos?query.size()-start:separator-start); const auto equal=token.find('='); if(equal!=std::string_view::npos && equal>0) result.values.emplace(url_decode(token.substr(0,equal)),url_decode(token.substr(equal+1))); if(separator==std::string_view::npos) break; start=separator+1; }
     return result;
 }
 
@@ -207,6 +235,7 @@ private:
                         result["interface"] = value.value("interface", "");
                         result["packets_captured"] = value.value("packets_captured", 0);
                         result["packets_processed"] = value.value("packets_processed", 0);
+                        result["packets_failed"] = value.value("packets_failed", 0);
                         result["last_packet_time"] = value.value("last_packet_time", 0.0);
                     } else {
                         result["capture_status"] = "STALE";

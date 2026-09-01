@@ -2,9 +2,14 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <fstream>
+#include <map>
 #include <set>
+#include <sstream>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 namespace delta_nids::detection {
 namespace {
@@ -14,28 +19,96 @@ void error(RuleLoadResult& result, std::size_t index, const char* field, const s
     result.errors.push_back({index, field, message});
 }
 
-std::optional<PortRange> parse_port(const json& value, RuleLoadResult& result, std::size_t index, const char* field) {
-    if (value.is_string() && value.get<std::string>() == "any") return std::nullopt;
-    if (value.is_number_unsigned()) {
-        const auto port = value.get<unsigned>();
-        if (port <= 65535) return PortRange{static_cast<std::uint16_t>(port), static_cast<std::uint16_t>(port)};
-    }
-    if (value.is_string()) {
-        const auto text = value.get<std::string>();
-        const auto separator = text.find(':');
+// Canonical port groups shared with the Python parser. The dashboard/API
+// resolves variables before compiling a rule into canonical port tokens; the
+// file loader resolves the same defaults so file-based rules behave
+// identically to UI rules.
+const std::map<std::string, std::vector<std::uint16_t>> PORT_VARIABLES = {
+    {"HTTP_PORTS", {80, 8080, 8000, 8008, 8888}},
+    {"HTTPS_PORTS", {443, 8443}},
+    {"DNS_PORTS", {53}},
+    {"SSH_PORTS", {22}},
+    {"FTP_PORTS", {20, 21}},
+    {"SMTP_PORTS", {25}},
+    {"DATABASE_PORTS", {1433, 1521, 3306, 5432}},
+};
+
+std::vector<std::uint16_t> expand_variable(const std::string& name) {
+    const auto found = PORT_VARIABLES.find(name);
+    if (found == PORT_VARIABLES.end()) return {};
+    return found->second;
+}
+
+std::vector<PortRange> parse_port_list(const std::string& raw, RuleLoadResult& result,
+                                        std::size_t index, const char* field) {
+    std::vector<PortRange> ranges;
+    std::string text = raw;
+    if (text.size() >= 2 && text.front() == '[' && text.back() == ']') text = text.substr(1, text.size() - 2);
+    std::istringstream stream(text);
+    std::string token;
+    while (std::getline(stream, token, ',')) {
+        if (token.empty() || token.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+        if (token.front() == '$') {
+            const auto ports = expand_variable(token.substr(1));
+            if (ports.empty()) {
+                std::ostringstream available;
+                bool first = true;
+                for (const auto& entry : PORT_VARIABLES) {
+                    if (!first) available << ", ";
+                    available << "$" << entry.first;
+                    first = false;
+                }
+                error(result, index, field,
+                      "Unknown port variable '" + token + "'. Available variables: " + available.str() + ".");
+                return {};
+            }
+            if (ranges.empty() && !ports.empty()) ranges.reserve(ports.size());
+            for (const auto port : ports) ranges.push_back({port, port});
+            continue;
+        }
+        const auto separator = token.find(':');
         try {
             if (separator == std::string::npos) {
-                const auto port = std::stoul(text);
-                if (port <= 65535) return PortRange{static_cast<std::uint16_t>(port), static_cast<std::uint16_t>(port)};
+                const auto port = std::stoul(token);
+                if (port > 65535) throw std::out_of_range("port");
+                ranges.push_back({static_cast<std::uint16_t>(port), static_cast<std::uint16_t>(port)});
             } else {
-                const auto first = separator == 0 ? 0UL : std::stoul(text.substr(0, separator));
-                const auto last = separator + 1 == text.size() ? 65535UL : std::stoul(text.substr(separator + 1));
-                if (first <= last && last <= 65535) return PortRange{static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)};
+                const auto first = separator == 0 ? 0UL : std::stoul(token.substr(0, separator));
+                const auto last = separator + 1 == token.size() ? 65535UL : std::stoul(token.substr(separator + 1));
+                if (first > last || last > 65535) throw std::out_of_range("range");
+                ranges.push_back({static_cast<std::uint16_t>(first), static_cast<std::uint16_t>(last)});
             }
-        } catch (const std::exception&) {}
+        } catch (const std::exception&) {
+            error(result, index, field,
+                  "invalid port expression '" + token + "'; expected 80, 80,443, [80,443], 1:1024, or $HTTP_PORTS");
+            return {};
+        }
     }
-    error(result, index, field, "expected 'any', a port, or a port range");
-    return std::nullopt;
+    return ranges;
+}
+
+std::vector<PortRange> parse_port(const json& value, RuleLoadResult& result, std::size_t index, const char* field) {
+    if (value.is_string() && value.get<std::string>() == "any") return {};
+    if (value.is_number_unsigned()) {
+        const auto port = value.get<unsigned>();
+        if (port <= 65535) return {PortRange{static_cast<std::uint16_t>(port), static_cast<std::uint16_t>(port)}};
+        error(result, index, field, "port out of range 0-65535");
+        return {};
+    }
+    if (value.is_string()) return parse_port_list(value.get<std::string>(), result, index, field);
+    if (value.is_array()) {
+        std::vector<PortRange> ranges;
+        for (const auto& entry : value) {
+            if (!entry.is_number_unsigned() || entry.get<unsigned>() > 65535) {
+                error(result, index, field, "port list entries must be ports 0-65535");
+                return {};
+            }
+            ranges.push_back({static_cast<std::uint16_t>(entry.get<unsigned>()), static_cast<std::uint16_t>(entry.get<unsigned>())});
+        }
+        return ranges;
+    }
+    error(result, index, field, "expected 'any', a port, a port list, a range, or a port variable");
+    return {};
 }
 
 packet::TransportProtocol protocol_from(const std::string& value) {
@@ -123,8 +196,8 @@ RuleLoadResult load_rules(const std::string& path) {
         const auto protocol = item.value("protocol", "TCP");
         rule.protocol = protocol_from(protocol);
         if (rule.protocol == packet::TransportProtocol::none) error(result, index, "protocol", "unsupported protocol");
-        if (item.contains("src_port")) rule.source_port = parse_port(item["src_port"], result, index, "src_port");
-        if (item.contains("dst_port")) rule.destination_port = parse_port(item["dst_port"], result, index, "dst_port");
+        if (item.contains("src_port")) rule.source_ports = parse_port(item["src_port"], result, index, "src_port");
+        if (item.contains("dst_port")) rule.destination_ports = parse_port(item["dst_port"], result, index, "dst_port");
         const auto direction = item.value("direction", "any");
         if (direction == "client_to_server") rule.direction = RuleDirection::client_to_server;
         else if (direction == "server_to_client") rule.direction = RuleDirection::server_to_client;

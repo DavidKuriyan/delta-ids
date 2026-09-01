@@ -30,6 +30,27 @@ from core.packet_capture import PacketCapture, auto_detect_interface, interface_
 from core.detection_engine import DetectionEngine
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Delta IDS - terminal-only network intrusion detection")
     source = parser.add_mutually_exclusive_group()
@@ -41,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", help="optional SQLite database path")
     parser.add_argument("--persist", action="store_true", help="persist traffic and alerts to SQLite")
     parser.add_argument("--quiet", action="store_true", help="do not print alerts")
+    parser.add_argument("--purge-false-positives", action="store_true",
+                        help="remove stored SID 90002 alerts whose evidence cannot justify a host-discovery sweep (uses current thresholds)")
     return parser
 
 
@@ -54,15 +77,31 @@ def main(argv=None) -> int:
     db_path = args.db or os.path.join(root, "database", "nids.db")
 
     try:
-        engine = DetectionEngine(rules_path)
-        manager = AlertManager(db_path=db_path, terminal=not args.quiet, persist=args.persist)
+        engine = DetectionEngine(rules_path, runtime_db_path=db_path if args.persist else None)
+        manager = AlertManager(db_path=db_path, terminal=not args.quiet,
+                               persist=args.persist or args.purge_false_positives)
+        if args.purge_false_positives:
+            removed = manager.purge_false_sweep_alerts(
+                host_threshold=_env_int("DELTA_NIDS_PING_THRESHOLD", 5),
+            )
+            print(f"purged {removed} non-justifiable host-discovery sweep alerts")
+            return 0
         if manager.session:
             # A process restart starts a new capture session. Preserve rules, but
             # never allow historical evidence or runtime state to reappear.
             manager.reset_session_data()
         if manager.session:
             manager.persist_rules(engine.rules, rules_path)
-        core = DeltaCore(manager, engine)
+        core = DeltaCore(
+            manager, engine,
+            scan_window=_env_float("DELTA_NIDS_SCAN_WINDOW", 30.0),
+            port_threshold=_env_int("DELTA_NIDS_PORT_SCAN_THRESHOLD", 8),
+            ping_threshold=_env_int("DELTA_NIDS_PING_THRESHOLD", 5),
+            remote_sweep_threshold=_env_int("DELTA_NIDS_REMOTE_SWEEP_THRESHOLD", 200),
+            remote_sweep_enabled=_env_bool("DELTA_NIDS_REMOTE_SWEEP_ENABLED", False),
+            dns_threshold=_env_int("DELTA_NIDS_DNS_QUERY_THRESHOLD", 50),
+            brute_force_threshold=_env_int("DELTA_NIDS_BRUTE_FORCE_THRESHOLD", 30),
+        )
         capture = PacketCapture(core.process_packet, interface=args.interface, pcap_path=args.pcap,
                                 bpf_filter=args.filter, count=args.count)
     except (FileNotFoundError, ValueError, OSError) as exc:
@@ -81,7 +120,8 @@ def main(argv=None) -> int:
             age = time.time() - last_packet if last_packet is not None else None
             activity = "ACTIVE" if age is not None and age <= 10 else "IDLE"
             manager.persist_runtime_status(activity, source_name, capture.packets_seen,
-                                           core.packets_sniffed, last_packet)
+                                           core.packets_sniffed, last_packet,
+                                           packets_failed=capture.packets_failed)
 
     heartbeat_thread = threading.Thread(target=heartbeat, name="delta-nids-heartbeat", daemon=True)
     heartbeat_thread.start()
@@ -97,7 +137,8 @@ def main(argv=None) -> int:
         print("replaying PCAP")
     try:
         manager.persist_runtime_status("STARTING", source_name, capture.packets_seen,
-                                       core.packets_sniffed, capture.last_packet_time)
+                                       core.packets_sniffed, capture.last_packet_time,
+                                       packets_failed=capture.packets_failed)
         capture.run()
     except KeyboardInterrupt:
         print("\nstopped")
@@ -112,7 +153,8 @@ def main(argv=None) -> int:
         heartbeat_thread.join(timeout=3)
         capture.stop()
         manager.persist_runtime_status(capture.state, source_name, capture.packets_seen,
-                                       core.packets_sniffed, capture.last_packet_time)
+                                       core.packets_sniffed, capture.last_packet_time,
+                                       packets_failed=capture.packets_failed)
     print(f"packets={core.packets_sniffed} alerts={manager.get_alert_counts()['total']}")
     return 0
 

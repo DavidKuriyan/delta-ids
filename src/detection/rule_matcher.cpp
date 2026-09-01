@@ -20,8 +20,12 @@ bool address_in_network(const packet::IpAddress& address, const Network& network
     return true;
 }
 
-bool port_matches(const std::optional<PortRange>& range, const std::optional<std::uint16_t>& port) {
-    return !range || (port && *port >= range->first && *port <= range->last);
+bool port_matches(const std::vector<PortRange>& ranges, const std::optional<std::uint16_t>& port) {
+    if (ranges.empty()) return true;
+    if (!port) return false;
+    for (const auto& range : ranges)
+        if (*port >= range.first && *port <= range.last) return true;
+    return false;
 }
 
 std::vector<std::uint8_t> fold(const std::vector<std::uint8_t>& value, bool nocase) {
@@ -72,8 +76,8 @@ std::vector<RuleMatch> RuleMatcher::match(const MatchContext& context) const {
         if (rule.direction == RuleDirection::server_to_client && context.direction != BufferDirection::server_to_client) continue;
         if (rule.source_network && !address_in_network(source, *rule.source_network)) continue;
         if (rule.destination_network && !address_in_network(destination, *rule.destination_network)) continue;
-        if (!port_matches(rule.source_port, std::optional<std::uint16_t>(flow.client.port))) continue;
-        if (!port_matches(rule.destination_port, std::optional<std::uint16_t>(flow.server.port))) continue;
+        if (!port_matches(rule.source_ports, std::optional<std::uint16_t>(flow.client.port))) continue;
+        if (!port_matches(rule.destination_ports, std::optional<std::uint16_t>(flow.server.port))) continue;
         const auto* buffer = context.buffers->get(rule.buffer);
         if (!buffer || rule.content.empty()) continue;
         const auto& data = buffer->data;

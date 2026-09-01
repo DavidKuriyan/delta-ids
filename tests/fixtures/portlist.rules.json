@@ -1,0 +1,38 @@
+[
+  {
+    "sid": 2000001,
+    "rev": 1,
+    "action": "ALERT",
+    "protocol": "TCP",
+    "dst_port": "80,443",
+    "content": "test",
+    "message": "port list"
+  },
+  {
+    "sid": 2000002,
+    "rev": 1,
+    "action": "ALERT",
+    "protocol": "TCP",
+    "dst_port": "[8080,8443]",
+    "content": "test",
+    "message": "bracketed list"
+  },
+  {
+    "sid": 2000003,
+    "rev": 1,
+    "action": "ALERT",
+    "protocol": "TCP",
+    "dst_port": "1:1024",
+    "content": "test",
+    "message": "range"
+  },
+  {
+    "sid": 2000004,
+    "rev": 1,
+    "action": "ALERT",
+    "protocol": "TCP",
+    "dst_port": "$HTTP_PORTS",
+    "content": "test",
+    "message": "variable"
+  }
+]

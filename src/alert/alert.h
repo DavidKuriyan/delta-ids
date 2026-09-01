@@ -49,6 +49,8 @@ struct AlertConfig {
 [[nodiscard]] Severity severity_from_rule(detection::RuleSeverity severity) noexcept;
 [[nodiscard]] std::string fingerprint_for(const detection::DetectionEvent& event,
                                           const std::string& source_ip,
-                                          const std::string& destination_ip);
+                                          const std::string& destination_ip,
+                                          std::uint16_t source_port = 0,
+                                          std::uint16_t destination_port = 0);
 
 }  // namespace delta_nids::alert

@@ -147,16 +147,20 @@ python run_project.py --no-capture --db database/nids.sqlite
 .venv/bin/python dashboard/app.py
 ```
 
-Python capture options include `--interface`, `--pcap`, `--config`, `--filter`, `--count`, `--db`, `--persist`, and `--quiet`. The default rule file is `rules/rules.json` and the default live BPF filter is `ip`. For a clean Nmap validation run, use a dedicated writable database and record the selected adapter; see [`docs/nmap-validation.md`](docs/nmap-validation.md).
+Python capture options include `--interface`, `--pcap`, `--config`, `--filter`, `--count`, `--db`, `--persist`, and `--quiet`. The default rule file is `rules/rules.json`; the default live BPF filter is empty so all protocols are captured. Port groups are read from `rules/port_variables.json`. For a clean Nmap validation run, use a dedicated writable database and record the selected adapter; see [`docs/nmap-validation.md`](docs/nmap-validation.md) for the host-discovery/visibility root-cause checklist.
 
 ## Detection behavior
 
-- Supported explicit rule conditions are matched by the Python rule engine.
+- Supported explicit rule conditions are matched by the Python rule engine. Rule port expressions accept `80`, `80,443`, `[80,443]`, `1:1024`, and pre-defined port variables such as `$HTTP_PORTS` or `$HTTP_PORTS,$HTTPS_PORTS`; the parser normalizes every accepted form into one canonical port set, so rules behave identically when added through the dashboard, through the API, loaded from `rules/rules.json`, or refreshed from the runtime database.
+- Pre-defined port groups are centrally configurable in `rules/port_variables.json` (`$HTTP_PORTS`, `$HTTPS_PORTS`, `$DNS_PORTS`, `$SSH_PORTS`, `$FTP_PORTS`, `$SMTP_PORTS`, `$DATABASE_PORTS`) and can be overridden with the `DELTA_NIDS_PORT_VARIABLES` JSON environment variable. Unknown variables fail validation with a message listing the available variables.
 - Metadata-only or legacy `heuristic_payload` entries are reported as unsupported and are not treated as payload signatures.
-- Behavioral port scans require distinct destination ports for the same source, destination, and protocol within the configured window.
+- Behavioral port scans require distinct destination ports for the same source, destination, and protocol within the configured window; the alert is emitted as soon as the threshold is reached (no batch waiting).
 - Duplicate UDP/DNS packets and a single DNS request do not constitute a port scan.
-- ICMP echo requests and ICMP target sweeps are handled separately.
+- Ordinary ICMP echo requests are bounded per-window INFO visibility events, not attacks. Host-discovery sweeps (SID 90002) require multiple **distinct non-public** targets within the window, so normal Internet browsing, CDN traffic, and gateway ARP resolution do not alarm. Sweep correlation covers ICMP and TCP only; TCP sweeps are correlated per destination port. ARP requests are intentionally excluded (gateway/neighbor L2 resolution is normal housekeeping), so the former ARP host-discovery sweep rule no longer fires and `DELTA_NIDS_ARP_SWEEP_THRESHOLD` has been removed. The window and thresholds are configurable via `DELTA_NIDS_SCAN_WINDOW`, `DELTA_NIDS_PING_THRESHOLD` (ICMP/TCP host discovery), `DELTA_NIDS_REMOTE_SWEEP_THRESHOLD`, and `DELTA_NIDS_REMOTE_SWEEP_ENABLED`.
+- ICMP/UDP/TCP anomalies are detected as RFC-invalid behaviour only. Behavioral detectors also cover outbound DNS query-rate anomalies, repeated RST/FIN connection failures, and invalid TCP flag combinations.
 - Alerts use `[gid:sid:rev]` identity and are deduplicated in SQLite by fingerprint.
+- Stored host-sweep alerts produced with a weaker pre-fix threshold can be removed by revalidating them against the current evidence contract:
+  `python main.py --db <path> --purge-false-positives`.
 
 ## Dashboard and API
 
@@ -217,6 +221,21 @@ Run Python tests and syntax checks:
 .venv/bin/python -m unittest discover -s tests -p 'test_*.py'
 .venv/bin/python -m py_compile core/*.py database/*.py main.py run_project.py dashboard/app.py
 ```
+
+Offline validation harness:
+
+```bash
+.venv/bin/python tools/validate_local.py
+.venv/bin/python tools/validate_local.py --json
+.venv/bin/python tools/validate_local.py --pcap captures/authorized-test.pcap
+```
+
+The default mode replays a controlled detection matrix (SYN/connect/UDP/ACK/FIN/
+NULL/Xmas scans, host sweeps, DNS anomalies, HTTP content rules, connection
+failures, TCP anomalies, and negative controls) through the real capture→
+detect→alert pipeline and reports captured/detected/false-positive per case. It
+is intentionally isolated and does not claim real Nmap, Npcap, VM, `eth0`, or
+live-dashboard validation.
 
 Useful native checks:
 

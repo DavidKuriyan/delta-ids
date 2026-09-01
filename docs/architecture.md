@@ -26,7 +26,7 @@ The common detection path receives normalized packets and does not depend on Lin
 
 ## Scan detection contract
 
-TCP port-scan detection uses a state key of source IP, destination IP, and protocol. Candidates require qualifying SYN traffic. Destination ports are deduplicated, state expires using a sliding window, and the number of active keys is bounded. Established ACK traffic, RST responses, unrelated destinations, and stale state must not create or inflate a scan event. Alert evidence contains the observed destination ports, not an inferred list of ports from the scanner's output.
+TCP/UDP scan detection uses a state key of source IP, destination IP, protocol, and probe class. TCP candidates are classified from observed flags (SYN, FIN, NULL, Xmas, Maimon/FIN+ACK); ACK-only probes require reverse response evidence in the Python path and remain conservative in the native path. Destination ports are deduplicated, state expires using a sliding window, and active keys/observations are bounded. Established ACK traffic, RST responses, unrelated destinations, and stale state must not create or inflate a scan event. Alert evidence contains the observed destination ports, not an inferred list of ports from scanner output.
 
 ## Incident correlation
 

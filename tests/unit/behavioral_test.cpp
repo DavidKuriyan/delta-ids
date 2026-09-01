@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cstdint>
+#include <algorithm>
 
 #include "behavioral/behavioral_manager.h"
 
@@ -116,6 +117,21 @@ int main() {
         }
     }
 
+    // Ordinary established traffic must not be interpreted as host discovery.
+    BehavioralManager ordinary_manager(config);
+    delta_nids::flow::Flow ordinary_flow;
+    ordinary_flow.id = 6;
+    ordinary_flow.service = "generic_tcp";
+    for (std::uint8_t target_host = 1; target_host <= 3; ++target_host) {
+        auto ordinary_pkt = packet(1, target_host, 443, target_host, 0x10); // ACK only
+        auto ordinary_events = ordinary_manager.observe(ordinary_pkt, ordinary_flow);
+        const bool emitted_host_sweep = std::any_of(
+            ordinary_events.begin(), ordinary_events.end(),
+            [](const auto& event) { return event.type == BehavioralType::host_sweep; });
+        (void)emitted_host_sweep;
+        assert(!emitted_host_sweep);
+    }
+
     // Test Host sweep / ICMP sweep detection (contacting multiple unique hosts)
     BehavioralManager sweep_manager(config);
     delta_nids::flow::Flow icmp_flow;
@@ -124,6 +140,10 @@ int main() {
     for (std::uint8_t target_host = 1; target_host <= 3; ++target_host) {
         auto sweep_pkt = packet(1, target_host, 0, target_host);
         sweep_pkt.transport = delta_nids::packet::TransportProtocol::icmp;
+        sweep_pkt.source_port.reset();
+        sweep_pkt.destination_port.reset();
+        sweep_pkt.tcp.reset();
+        sweep_pkt.icmp = delta_nids::packet::IcmpMetadata{8, 0};
         auto sweep_events = sweep_manager.observe(sweep_pkt, icmp_flow);
         if (target_host == 3) {
             bool found_sweep = false;

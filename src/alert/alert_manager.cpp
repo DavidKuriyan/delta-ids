@@ -23,11 +23,16 @@ Severity severity_from_rule(detection::RuleSeverity severity) noexcept {
 
 std::string fingerprint_for(const detection::DetectionEvent& event,
                             const std::string& source_ip,
-                            const std::string& destination_ip) {
+                            const std::string& destination_ip,
+                            std::uint16_t source_port,
+                            std::uint16_t destination_port) {
     std::ostringstream value;
-    value << static_cast<int>(event.type) << '|' << event.sid << '|' << event.revision << '|'
-          << source_ip << '|' << destination_ip << '|' << event.service << '|'
-          << static_cast<int>(event.buffer) << '|' << event.explanation;
+    value << static_cast<int>(event.type) << '|' << event.gid << '|' << event.sid << '|'
+          << event.revision << '|' << source_ip << '|' << source_port << '|'
+          << destination_ip << '|' << destination_port << '|' << event.flow_id << '|'
+          << event.service << '|' << event.protocol << '|' << static_cast<int>(event.buffer)
+          << '|' << event.explanation << '|'
+          << std::string(event.evidence.begin(), event.evidence.end());
     return std::to_string(std::hash<std::string>{}(value.str()));
 }
 
@@ -100,7 +105,8 @@ std::vector<Alert> AlertManager::ingest(const detection::DetectionEvent& event,
                                         std::uint16_t source_port,
                                         std::uint16_t destination_port) {
     std::vector<Alert> emitted;
-    const auto fingerprint = fingerprint_for(event, source_ip, destination_ip);
+    const auto fingerprint = fingerprint_for(event, source_ip, destination_ip,
+                                             source_port, destination_port);
     auto iterator = alerts_.find(fingerprint);
     if (iterator != alerts_.end()) {
         auto& alert = iterator->second;

@@ -73,6 +73,10 @@ class Rule(Base):
     gid = Column(Integer, nullable=False, default=1)
     priority = Column(Integer, nullable=False, default=3)
     protocol = Column(String(20))
+    category = Column(String(100))
+    rule_text = Column(Text)
+    rule_json = Column(Text)
+    updated_at = Column(Integer)
 
 
 class IncidentAlert(Base):
@@ -131,6 +135,10 @@ _MIGRATIONS = (
     ("rules", "gid", "INTEGER NOT NULL DEFAULT 1"),
     ("rules", "priority", "INTEGER NOT NULL DEFAULT 3"),
     ("rules", "protocol", "VARCHAR(20)"),
+    ("rules", "category", "VARCHAR(100)"),
+    ("rules", "rule_text", "TEXT"),
+    ("rules", "rule_json", "TEXT"),
+    ("rules", "updated_at", "INTEGER"),
     ("statistics", "text_value", "TEXT"),
 )
 

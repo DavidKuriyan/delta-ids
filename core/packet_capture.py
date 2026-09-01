@@ -4,6 +4,7 @@ import os
 import socket
 import struct
 import threading
+import hashlib
 from typing import Callable, Optional
 import logging
 import time
@@ -13,7 +14,7 @@ if os.name == "nt":
     if os.path.exists(npcap_dir) and npcap_dir not in os.environ.get("PATH", ""):
         os.environ["PATH"] = npcap_dir + os.pathsep + os.environ.get("PATH", "")
 
-from scapy.all import Ether, ICMP, IP, TCP, UDP, conf, get_if_addr, get_if_list, rdpcap, sniff
+from scapy.all import ARP, Ether, IP, ICMP, IPv6, IPv6ExtHdrHopByHop, IPv6ExtHdrDestOpt, IPv6ExtHdrRouting, IPv6ExtHdrFragment, ICMPv6EchoRequest, ICMPv6DestUnreach, TCP, UDP, conf, get_if_addr, get_if_list, rdpcap, sniff
 
 logger = logging.getLogger("delta-ids.capture")
 
@@ -87,6 +88,15 @@ def _decoded_details(packet, info: dict) -> dict:
         details["src_mac"] = packet[Ether].src
         details["dst_mac"] = packet[Ether].dst
         details["ethertype"] = hex(int(packet[Ether].type))
+    if IPv6 in packet:
+        ip_layer = packet[IPv6]
+        details.update({
+            "ip_version": _safe_int(ip_layer.version),
+            "ip_header_length": 40,
+            "ip_hop_limit": _safe_int(ip_layer.hlim),
+            "ip_next_header": _safe_int(ip_layer.nh),
+            "ip_payload_length": _safe_int(ip_layer.plen),
+        })
     if IP in packet:
         ip_layer = packet[IP]
         details.update({
@@ -105,6 +115,7 @@ def _decoded_details(packet, info: dict) -> dict:
         details.update({
             "tcp_sequence": _safe_int(tcp_layer.seq),
             "tcp_acknowledgment": _safe_int(tcp_layer.ack),
+            "tcp_flags": str(tcp_layer.flags),
             "tcp_header_length": (_safe_int(tcp_layer.dataofs) or 0) * 4,
             "tcp_window": _safe_int(tcp_layer.window),
             "tcp_checksum": hex(int(tcp_layer.chksum)) if tcp_layer.chksum is not None else None,
@@ -119,6 +130,8 @@ def _decoded_details(packet, info: dict) -> dict:
     elif ICMP in packet:
         icmp_layer = packet[ICMP]
         details.update({
+            "icmp_type": _safe_int(icmp_layer.type),
+            "icmp_code": _safe_int(icmp_layer.code),
             "icmp_id": _safe_int(icmp_layer.id),
             "icmp_sequence": _safe_int(icmp_layer.seq),
             "icmp_checksum": hex(int(icmp_layer.chksum)) if icmp_layer.chksum is not None else None,
@@ -131,13 +144,46 @@ def _decoded_details(packet, info: dict) -> dict:
 
 
 def packet_to_info(packet) -> Optional[dict]:
-    """Normalise a Scapy IPv4 packet into the Delta-NIDS packet contract."""
-    if IP not in packet:
+    """Normalise an observed packet into the shared Delta-NIDS packet contract."""
+    if ARP in packet and IP not in packet and IPv6 not in packet:
+        arp = packet[ARP]
+        return {
+            "src_ip": getattr(arp, "psrc", None),
+            "dst_ip": getattr(arp, "pdst", None),
+            "protocol": "ARP",
+            "src_port": None,
+            "dst_port": None,
+            "length": len(packet),
+            "payload": b"",
+            "icmp_type": None,
+            "icmp_code": None,
+            "tcp_flags": None,
+            "details": {"arp_op": _safe_int(getattr(arp, "op", None)),
+                         "src_mac": getattr(arp, "hwsrc", None),
+                         "dst_mac": getattr(arp, "hwdst", None)},
+        }
+    if IP not in packet and IPv6 not in packet:
         return None
 
+    # Scapy's IPv6 extension layers can leave the transport protocol hidden
+    # from direct layer lookup. Walk the payload chain so TCP/UDP/ICMPv6 remain
+    # visible after Hop-by-Hop, Destination, Routing, or Fragment headers.
+    transport_layer = None
+    if IPv6 in packet and not any(layer_type in packet for layer_type in (TCP, UDP, ICMPv6EchoRequest)):
+        transport_layer = packet[IPv6].payload
+        for _ in range(16):
+            if isinstance(transport_layer, (TCP, UDP, ICMPv6EchoRequest)):
+                break
+            next_layer = getattr(transport_layer, "payload", None)
+            if next_layer is None or next_layer is transport_layer:
+                transport_layer = None
+                break
+            transport_layer = next_layer
+
+    ip_layer = packet[IP] if IP in packet else packet[IPv6]
     info = {
-        "src_ip": packet[IP].src,
-        "dst_ip": packet[IP].dst,
+        "src_ip": ip_layer.src,
+        "dst_ip": ip_layer.dst,
         "protocol": "IP",
         "src_port": None,
         "dst_port": None,
@@ -145,17 +191,68 @@ def packet_to_info(packet) -> Optional[dict]:
         "payload": b"",
         "icmp_type": None,
         "icmp_code": None,
+        "icmp_inner_src_ip": None,
+        "icmp_inner_dst_ip": None,
+        "icmp_inner_src_port": None,
+        "icmp_inner_dst_port": None,
+        "icmp_inner_protocol": None,
         "tcp_flags": None,
+        "tcp_sequence": None,
+        "tcp_acknowledgment": None,
+        "icmp_id": None,
+        "icmp_sequence": None,
     }
-    if TCP in packet:
-        info.update(protocol="TCP", src_port=int(packet[TCP].sport), dst_port=int(packet[TCP].dport),
-                    tcp_flags=str(packet[TCP].flags), payload=bytes(packet[TCP].payload))
-    elif UDP in packet:
-        info.update(protocol="UDP", src_port=int(packet[UDP].sport), dst_port=int(packet[UDP].dport),
-                    payload=bytes(packet[UDP].payload))
+    icmpv6_error_layer = packet[ICMPv6DestUnreach] if ICMPv6DestUnreach in packet else (transport_layer if isinstance(transport_layer, ICMPv6DestUnreach) else None)
+    tcp_layer = packet[TCP] if TCP in packet and icmpv6_error_layer is None else (transport_layer if isinstance(transport_layer, TCP) else None)
+    udp_layer = packet[UDP] if UDP in packet and icmpv6_error_layer is None else (transport_layer if isinstance(transport_layer, UDP) else None)
+    icmpv6_layer = packet[ICMPv6EchoRequest] if ICMPv6EchoRequest in packet and icmpv6_error_layer is None else (transport_layer if isinstance(transport_layer, ICMPv6EchoRequest) else None)
+    if tcp_layer is not None:
+        info.update(protocol="TCP", src_port=int(tcp_layer.sport), dst_port=int(tcp_layer.dport),
+                    tcp_flags=str(tcp_layer.flags), tcp_sequence=_safe_int(tcp_layer.seq),
+                    tcp_acknowledgment=_safe_int(tcp_layer.ack), payload=bytes(tcp_layer.payload))
+    elif udp_layer is not None:
+        info.update(protocol="UDP", src_port=int(udp_layer.sport), dst_port=int(udp_layer.dport),
+                    payload=bytes(udp_layer.payload))
     elif ICMP in packet:
-        info.update(protocol="ICMP", icmp_type=int(packet[ICMP].type), icmp_code=int(packet[ICMP].code),
-                    payload=bytes(packet[ICMP].payload))
+        icmp = packet[ICMP]
+        info.update(protocol="ICMP", icmp_type=int(icmp.type), icmp_code=int(icmp.code),
+                    icmp_id=_safe_int(getattr(icmp, "id", None)),
+                    icmp_sequence=_safe_int(getattr(icmp, "seq", None)),
+                    payload=bytes(icmp.payload))
+        inner = getattr(icmp, "payload", None)
+        if inner is not None and IP in inner:
+            info["icmp_inner_src_ip"] = inner[IP].src
+            info["icmp_inner_dst_ip"] = inner[IP].dst
+            info["icmp_inner_protocol"] = str(getattr(inner[IP], "proto", ""))
+            if UDP in inner:
+                info["icmp_inner_src_port"] = _safe_int(inner[UDP].sport)
+                info["icmp_inner_dst_port"] = _safe_int(inner[UDP].dport)
+            elif TCP in inner:
+                info["icmp_inner_src_port"] = _safe_int(inner[TCP].sport)
+                info["icmp_inner_dst_port"] = _safe_int(inner[TCP].dport)
+    elif IPv6 in packet:
+        # Scapy may expose ICMPv6 packets through concrete layers; preserve
+        # quoted IPv6 transport headers for passive UDP scan correlation.
+        icmpv6 = icmpv6_layer
+        if icmpv6 is not None:
+            info.update(protocol="ICMPv6", icmp_type=128, icmp_code=0,
+                        icmp_id=_safe_int(getattr(icmpv6, "id", None)),
+                        icmp_sequence=_safe_int(getattr(icmpv6, "seq", None)),
+                        payload=bytes(icmpv6.payload))
+        elif icmpv6_error_layer is not None:
+            info.update(protocol="ICMPv6", icmp_type=_safe_int(getattr(icmpv6_error_layer, "type", None)),
+                        icmp_code=_safe_int(getattr(icmpv6_error_layer, "code", None)),
+                        payload=bytes(icmpv6_error_layer.payload))
+            inner = getattr(icmpv6_error_layer, "payload", None)
+            if inner is not None and IPv6 in inner:
+                info["icmp_inner_src_ip"] = inner[IPv6].src
+                info["icmp_inner_dst_ip"] = inner[IPv6].dst
+                info["icmp_inner_protocol"] = str(getattr(inner[IPv6], "nh", ""))
+                if UDP in inner:
+                    info["icmp_inner_src_port"] = _safe_int(inner[UDP].sport)
+                    info["icmp_inner_dst_port"] = _safe_int(inner[UDP].dport)
+        else:
+            info["protocol"] = "IPV6"
     info["details"] = _decoded_details(packet, info)
     return info
 
@@ -211,6 +308,13 @@ def _raw_ip_to_info(raw_data: bytes) -> Optional[dict]:
         if len(transport) >= 8:
             info["details"]["icmp_id"] = struct.unpack("!H", transport[4:6])[0]
             info["details"]["icmp_sequence"] = struct.unpack("!H", transport[6:8])[0]
+        inner = _raw_ip_to_info(transport[8:]) if len(transport) > 8 else None
+        if inner:
+            info["icmp_inner_src_ip"] = inner.get("src_ip")
+            info["icmp_inner_dst_ip"] = inner.get("dst_ip")
+            info["icmp_inner_protocol"] = inner.get("protocol")
+            info["icmp_inner_src_port"] = inner.get("src_port")
+            info["icmp_inner_dst_port"] = inner.get("dst_port")
     elif protocol_num == 6 and len(transport) >= 20:  # TCP
         src_port, dst_port = struct.unpack("!HH", transport[0:4])
         data_offset = (transport[12] >> 4) * 4
@@ -218,7 +322,9 @@ def _raw_ip_to_info(raw_data: bytes) -> Optional[dict]:
         flag_str = "".join(f for f, b in [("F", 0x01), ("S", 0x02), ("R", 0x04),
                                            ("P", 0x08), ("A", 0x10), ("U", 0x20)] if flags & b)
         info.update(protocol="TCP", src_port=src_port, dst_port=dst_port,
-                    tcp_flags=flag_str, payload=transport[data_offset:])
+                    tcp_flags=flag_str, tcp_sequence=struct.unpack("!I", transport[4:8])[0],
+                    tcp_acknowledgment=struct.unpack("!I", transport[8:12])[0],
+                    payload=transport[data_offset:])
     elif protocol_num == 17 and len(transport) >= 8:  # UDP
         src_port, dst_port = struct.unpack("!HH", transport[0:4])
         info.update(protocol="UDP", src_port=src_port, dst_port=dst_port,
@@ -340,7 +446,11 @@ class PacketCapture:
         self.state = "STARTING"
         self._raw_cap: Optional[_WindowsRawCapture] = None
         self._seen_lock = threading.Lock()
-        self._seen_packets: set = set()
+        # Keys are retained only briefly so overlapping capture backends do not
+        # double-dispatch a frame, while a later real scan with identical probe
+        # fields is still observable.
+        self._seen_packets: dict[tuple, float] = {}
+        self._duplicate_window_seconds = 1.0
 
     def _is_duplicate(self, info: dict) -> bool:
         details = info.get("details") or {}
@@ -352,15 +462,25 @@ class PacketCapture:
             info.get("dst_port"),
             details.get("ip_id"),
             info.get("tcp_flags"),
+            info.get("tcp_sequence"),
             info.get("icmp_sequence"),
+            hashlib.sha256(info.get("payload") or b"").digest(),
             len(info.get("payload") or b"")
         )
+        now = time.monotonic()
         with self._seen_lock:
+            cutoff = now - self._duplicate_window_seconds
+            self._seen_packets = {
+                packet_key: seen_at for packet_key, seen_at in self._seen_packets.items()
+                if seen_at >= cutoff
+            }
             if key in self._seen_packets:
                 return True
-            self._seen_packets.add(key)
+            self._seen_packets[key] = now
             if len(self._seen_packets) > 10000:
-                self._seen_packets.clear()
+                oldest = sorted(self._seen_packets, key=self._seen_packets.get)
+                for packet_key in oldest[:len(self._seen_packets) - 10000]:
+                    self._seen_packets.pop(packet_key, None)
             return False
 
     def _dispatch(self, packet) -> None:

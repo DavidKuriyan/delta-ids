@@ -40,8 +40,11 @@ struct Rule {
     packet::TransportProtocol protocol = packet::TransportProtocol::none;
     std::optional<Network> source_network;
     std::optional<Network> destination_network;
-    std::optional<PortRange> source_port;
-    std::optional<PortRange> destination_port;
+    // Empty vectors mean "any". Canonical multi-port rules ("80,443",
+    // "1:1024", "$HTTP_PORTS") compile into one PortRange per token so
+    // dashboard, API, and file-loaded rules all match identically.
+    std::vector<PortRange> source_ports;
+    std::vector<PortRange> destination_ports;
     RuleDirection direction = RuleDirection::any;
     std::optional<protocol::Service> service;
     BufferName buffer = BufferName::payload;

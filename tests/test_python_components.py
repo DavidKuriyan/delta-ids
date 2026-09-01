@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scapy.all import Ether, IP, TCP, UDP, ICMP, Raw
+from scapy.all import Ether, IP, IPv6, TCP, UDP, ICMP, ICMPv6EchoRequest, Raw
 
 from core.alert_manager import AlertManager
 from core.delta_core import DeltaCore
@@ -31,6 +31,15 @@ class RecordingAlerts:
 
 
 class PacketNormalizationTests(unittest.TestCase):
+    def test_ipv6_extension_header_transport_is_decoded(self):
+        from scapy.all import IPv6ExtHdrHopByHop
+        packet = Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") / IPv6ExtHdrHopByHop() / TCP(sport=40000, dport=443, flags="S")
+        info = packet_to_info(packet)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["protocol"], "TCP")
+        self.assertEqual(info["src_port"], 40000)
+        self.assertEqual(info["dst_port"], 443)
+
     def test_tcp_udp_icmp_and_non_ip(self):
         tcp = packet_to_info(Ether() / IP(src="192.0.2.1", dst="198.51.100.1") /
                              TCP(sport=40000, dport=80, flags="PA") / Raw(b"GET /test"))
@@ -46,6 +55,34 @@ class PacketNormalizationTests(unittest.TestCase):
                               ICMP(type=8, code=0) / Raw(b"ping"))
         self.assertEqual((icmp["protocol"], icmp["icmp_type"], icmp["icmp_code"]), ("ICMP", 8, 0))
         self.assertIsNone(packet_to_info(Ether() / b"arp"))
+
+    def test_ipv6_tcp_and_udp_normalize_for_active_pipeline(self):
+        tcp = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                             TCP(sport=40000, dport=443, flags="S"))
+        udp = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                             UDP(sport=53000, dport=53) / Raw(b"dns6"))
+        self.assertEqual((tcp["protocol"], tcp["src_port"], tcp["dst_port"]), ("TCP", 40000, 443))
+        self.assertEqual((udp["protocol"], udp["src_port"], udp["dst_port"], udp["payload"]),
+                         ("UDP", 53000, 53, b"dns6"))
+
+    def test_ipv6_echo_request_normalizes_for_active_pipeline(self):
+        packet = packet_to_info(Ether() / IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                                ICMPv6EchoRequest(id=7, seq=3) / Raw(b"ping6"))
+        self.assertIsNotNone(packet)
+        self.assertEqual((packet["protocol"], packet["src_ip"], packet["icmp_type"]),
+                         ("ICMPv6", "2001:db8::1", 128))
+        self.assertEqual(packet["payload"], b"ping6")
+
+    def test_ipv6_icmp_error_preserves_quoted_udp_probe(self):
+        from scapy.all import ICMPv6DestUnreach
+        packet = packet_to_info(Ether() / IPv6(src="2001:db8::2", dst="2001:db8::1") /
+                                ICMPv6DestUnreach(code=4) /
+                                (IPv6(src="2001:db8::1", dst="2001:db8::2") /
+                                 UDP(sport=53000, dport=161)))
+        self.assertIsNotNone(packet)
+        self.assertEqual(packet["protocol"], "ICMPv6")
+        self.assertEqual(packet["icmp_type"], 1)
+        self.assertEqual((packet["icmp_inner_src_port"], packet["icmp_inner_dst_port"]), (53000, 161))
 
     def test_raw_parser_rejects_truncated_and_decodes_icmp(self):
         self.assertIsNone(_raw_ip_to_info(b"\x45" + b"\x00" * 10))
@@ -107,6 +144,17 @@ class CaptureTests(unittest.TestCase):
 
 
 class CoreAndRulesTests(unittest.TestCase):
+    def test_icmpv6_request_and_sweep(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, ping_threshold=2)
+        for index in range(2):
+            core.process_packet({"src_ip": "2001:db8::1", "dst_ip": f"2001:db8::{index + 2}",
+                                 "protocol": "ICMPv6", "icmp_type": 128, "length": 64,
+                                 "payload": b""})
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90001, 90001, 90002])
+
     def test_icmp_request_and_sweep(self):
         recorder = RecordingAlerts()
         engine = DetectionEngine.__new__(DetectionEngine)
@@ -138,6 +186,131 @@ class CoreAndRulesTests(unittest.TestCase):
         alerts = engine.analyze_packet(packet)
         self.assertEqual(len(alerts), 1)
         self.assertEqual((alerts[0]["gid"], alerts[0]["sid"], alerts[0]["revision"]), (2, 77, 3))
+
+    def test_icmp_echo_to_same_target_aggregates_per_window(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, ping_threshold=3)
+        for sequence in range(1, 6):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.1",
+                                 "protocol": "ICMP", "icmp_type": 8, "icmp_id": 7,
+                                 "icmp_sequence": sequence, "length": 64, "payload": b""})
+        # Repeated pings to one target aggregate into a single bounded
+        # INFO-level visibility event instead of flooding one alert per ping.
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90001])
+        self.assertEqual(recorder.alerts[0]["severity"], "INFO")
+
+    def test_dns_query_rate_anomaly(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, dns_threshold=3)
+        for offset in range(4):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.53",
+                                 "protocol": "UDP", "src_port": 53000, "dst_port": 53,
+                                 "length": 40, "payload": bytes([offset])})
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90004])
+        # Emitted as soon as the threshold is reached (streaming): the 3rd
+        # query satisfies dns_threshold=3.
+        self.assertIn("query_count=3", recorder.alerts[0]["evidence"])
+
+    def test_dns_replies_are_not_query_anomalies(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, dns_threshold=2)
+        for offset in range(4):
+            core.process_packet({"src_ip": "198.51.100.53", "dst_ip": "192.0.2.1",
+                                 "protocol": "UDP", "src_port": 53, "dst_port": 45000,
+                                 "length": 40, "payload": bytes([offset])})
+        self.assertEqual(recorder.alerts, [])
+
+    def test_repeated_connection_failures(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, brute_force_threshold=3)
+        for sequence in range(4):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.1",
+                                 "protocol": "TCP", "src_port": 42000 + sequence,
+                                 "dst_port": 22, "tcp_flags": "R",
+                                 "tcp_sequence": sequence, "length": 40, "payload": b""})
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90005])
+        # Emitted as soon as the threshold is reached (streaming): the 3rd
+        # failure satisfies brute_force_threshold=3.
+        self.assertIn("connection_failures=3", recorder.alerts[0]["evidence"])
+
+    def test_fin_scan_is_not_connection_failure_flood(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, port_threshold=3, brute_force_threshold=2)
+        for port in (21, 22, 23):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.1",
+                                 "protocol": "TCP", "src_port": 40000,
+                                 "dst_port": port, "tcp_flags": "F",
+                                 "length": 60, "payload": b""})
+        sids = [alert["sid"] for alert in recorder.alerts]
+        self.assertEqual(sids, [90003])
+
+    def test_full_port_scale_evidence_is_bounded(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, port_threshold=150)
+        for port in range(1, 201):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.1",
+                                 "protocol": "TCP", "src_port": 10000 + port,
+                                 "dst_port": port, "tcp_flags": "S",
+                                 "length": 60, "payload": b""})
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90003])
+        evidence = recorder.alerts[0]["evidence"]
+        self.assertIn("distinct_destination_ports=150", evidence)
+        self.assertIn("(+54 more)", evidence)
+        self.assertLess(len(evidence), 2000, "evidence must stay bounded at scanner scale")
+
+    def test_single_port_probes_across_hosts_are_host_sweep_not_scan(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, ping_threshold=3)
+        for host in range(2, 7):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": f"198.51.100.{host}",
+                                 "protocol": "TCP", "src_port": 40000,
+                                 "dst_port": 443, "tcp_flags": "S",
+                                 "length": 60, "payload": b""})
+        # Zmap-class horizontal sweep: one port, many hosts -> host sweep, and
+        # no per-host multi-port scan is fabricated.
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90002])
+
+    def test_host_sweep_evidence_is_bounded(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine, ping_threshold=70)
+        for host in range(2, 82):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": f"198.51.100.{host}",
+                                 "protocol": "ICMP", "icmp_type": 8,
+                                 "length": 64, "payload": b""})
+        sweep = [alert for alert in recorder.alerts if alert["sid"] == 90002]
+        self.assertEqual(len(sweep), 1)
+        evidence = sweep[0]["evidence"]
+        self.assertIn("distinct_targets=70", evidence)
+        self.assertIn("(+6 more)", evidence)
+        self.assertLess(len(evidence), 4000)
+
+    def test_invalid_syn_fin_combination_is_anomaly_not_scan(self):
+        recorder = RecordingAlerts()
+        engine = DetectionEngine.__new__(DetectionEngine)
+        engine.analyze_packet = lambda packet: []
+        core = DeltaCore(recorder, engine)
+        for port in (21, 22, 23):
+            core.process_packet({"src_ip": "192.0.2.1", "dst_ip": "198.51.100.1",
+                                 "protocol": "TCP", "src_port": 40000,
+                                 "dst_port": port, "tcp_flags": "SF",
+                                 "tcp_sequence": port, "length": 60, "payload": b""})
+        self.assertEqual([a["sid"] for a in recorder.alerts], [90006, 90006, 90006])
 
     def test_simulated_live_attacker_scan(self):
         recorder = RecordingAlerts()
